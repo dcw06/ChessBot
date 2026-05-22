@@ -859,11 +859,7 @@ function onDragStart(source, piece) {
   if (humanColor === 'black' && piece[0] === 'w') return false;
   document.body.classList.add('is-dragging');
   clearSelection();
-  // Show hints during drag only on our turn (premove drag gets no dots)
-  if (game.turn() === humanColor[0]) {
-    showLegalDots(source);
-    $(`#board .square-${source}`).addClass('sq-sel');
-  }
+  $(`#board .square-${source}`).addClass('sq-sel'); // highlight dragged piece only (no dots — they'd flash and vanish)
 }
 
 function onDrop(source, target) {
@@ -879,7 +875,8 @@ function onDrop(source, target) {
   if (source === target) {
     const pieceObj = game.get(source);
     if (pieceObj && isOwnPiece(pieceObj.color + pieceObj.type.toUpperCase())) {
-      _pendingSelect = source; // re-select after snapback re-renders the board
+      selSquare = source;       // set immediately so destination clicks in the snapback window work
+      _pendingSelect = source;  // re-apply CSS after the board re-renders in onSnapEnd
     }
     return 'snapback';
   }
@@ -900,10 +897,17 @@ function onDrop(source, target) {
 }
 
 function onSnapEnd() {
-  clearLegalDots();
   document.body.classList.remove('is-dragging');
-  if (!premove) { board.position(game.fen()); applyHighlights(null); }
-  if (_pendingSelect) { const sq = _pendingSelect; _pendingSelect = null; selectSquare(sq); }
+  if (_pendingSelect) {
+    // Click-release on same square: position unchanged, just restore visual selection
+    clearLegalDots();
+    const sq = _pendingSelect;
+    _pendingSelect = null;
+    selectSquare(sq);
+  } else {
+    clearLegalDots();
+    if (!premove) { board.position(game.fen()); applyHighlights(null); }
+  }
 }
 
 // ── Click-to-move ──────────────────────────────────────────────────────────
@@ -1106,7 +1110,7 @@ function initBoard(data) {
     showNotation:    true,
     moveSpeed:       180,
     snapSpeed:       70,
-    snapbackSpeed:   260,
+    snapbackSpeed:   80,
     onDragStart,
     onDrop,
     onSnapEnd,
@@ -1256,7 +1260,7 @@ function openGameViewer(g) {
     showNotation:    true,
     moveSpeed:       180,
     snapSpeed:       70,
-    snapbackSpeed:   260,
+    snapbackSpeed:   80,
     onDragStart:     () => { document.body.classList.add('is-dragging'); return true; },
     onDrop:          avOnDrop,
     onSnapEnd:       avOnSnapEnd,
