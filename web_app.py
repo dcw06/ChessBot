@@ -18,7 +18,7 @@ from bot.think_timer import ThinkTimer
 
 app = Flask(__name__)
 
-USERNAME         = os.environ.get("USERNAME",         "yuandan")
+USERNAME         = os.environ.get("CHESS_USERNAME", os.environ.get("USERNAME", "yuandan"))
 MODEL_PATH       = os.environ.get("MODEL_PATH",       "best_model.pt")
 BOOK_PATH        = os.environ.get("BOOK_PATH",        "opening_book.json")
 LOCAL_GAMES_FILE = os.environ.get("LOCAL_GAMES_FILE", "local_games.json")
@@ -1800,6 +1800,7 @@ def get_state():
 @app.route("/debug")
 def debug():
     info = {
+        "username": USERNAME,
         "stockfish_path": STOCKFISH_PATH,
         "stockfish_exists": os.path.isfile(STOCKFISH_PATH) if STOCKFISH_PATH else False,
         "stockfish_which": shutil.which("stockfish"),
