@@ -3,6 +3,8 @@ import os
 import shutil
 import time
 import threading
+from dotenv import load_dotenv
+load_dotenv()
 import re
 import datetime
 import chess
@@ -16,10 +18,10 @@ from bot.think_timer import ThinkTimer
 
 app = Flask(__name__)
 
-USERNAME   = "yuandan"
-MODEL_PATH = "best_model.pt"
-BOOK_PATH        = "opening_book.json"
-LOCAL_GAMES_FILE = "local_games.json"
+USERNAME         = os.environ.get("USERNAME",         "yuandan")
+MODEL_PATH       = os.environ.get("MODEL_PATH",       "best_model.pt")
+BOOK_PATH        = os.environ.get("BOOK_PATH",        "opening_book.json")
+LOCAL_GAMES_FILE = os.environ.get("LOCAL_GAMES_FILE", "local_games.json")
 STOCKFISH_PATH   = (os.environ.get("STOCKFISH_PATH")
                     or shutil.which("stockfish")
                     or "/usr/games/stockfish")
@@ -96,7 +98,7 @@ def _check_game_over(s: dict):
         s["over"] = True
         if board.is_checkmate():
             loser = s["bot_color"] if board.turn == s["bot_color"] else "human"
-            s["result"] = "You win by checkmate!" if loser == s["bot_color"] else "Bot wins by checkmate!"
+            s["result"] = "You win by checkmate!" if loser == s["bot_color"] else "Alan Dai wins by checkmate!"
         elif board.is_stalemate():
             s["result"] = "Draw — stalemate."
         elif board.is_insufficient_material():
@@ -109,10 +111,10 @@ def _check_game_over(s: dict):
             s["result"] = f"Game over: {board.result()}"
     if s["bot_clock"] <= 0:
         s["over"] = True
-        s["result"] = "Bot flagged — you win on time!"
+        s["result"] = "Alan Dai flagged — you win on time!"
     if s["human_clock"] <= 0:
         s["over"] = True
-        s["result"] = "You flagged — bot wins on time!"
+        s["result"] = "You flagged — Alan Dai wins on time!"
     if s["over"] and not s.get("saved") and "aborted" not in s.get("result", "").lower():
         _save_local_game(s)
 
@@ -130,8 +132,8 @@ def _save_local_game(s: dict):
         pgn_game.headers["Event"] = "ChessBot"
         pgn_game.headers["Site"]  = "localhost"
         pgn_game.headers["Date"]  = datetime.datetime.now().strftime("%Y.%m.%d")
-        pgn_game.headers["White"] = "Bot"      if bot_white else USERNAME
-        pgn_game.headers["Black"] = USERNAME   if bot_white else "Bot"
+        pgn_game.headers["White"] = "Alan Dai" if bot_white else USERNAME
+        pgn_game.headers["Black"] = USERNAME   if bot_white else "Alan Dai"
 
         result_str = s.get("result", "")
         r = result_str.lower()
@@ -159,7 +161,7 @@ def _save_local_game(s: dict):
             "date":        datetime.datetime.now().strftime("%b %d"),
             "time_class":  tc,
             "result_text": result_str,
-            "opponent":    "Bot",
+            "opponent":    "Alan Dai",
             "opp_rating":  "",
             "opening":     "Bot Game",
             "url":         "",
@@ -320,7 +322,7 @@ HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>ChessBot — yuandan clone</title>
+<title>Alan Dai</title>
 <link rel="stylesheet"
       href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
 <style>
@@ -668,7 +670,7 @@ HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>ChessBot — yuandan clone</h1>
+<h1>Alan Dai</h1>
 
 <nav id="main-nav">
   <button class="nav-tab active" id="tab-play"    onclick="switchTab('play')">Play</button>
@@ -703,7 +705,7 @@ HTML = r"""<!DOCTYPE html>
   <div class="player-strip strip-top" id="top-strip">
     <div class="player-avatar" id="top-avatar">♟</div>
     <div class="player-meta">
-      <div class="player-name" id="top-name">Bot</div>
+      <div class="player-name" id="top-name">Alan Dai</div>
       <div class="player-sub"  id="top-sub"></div>
     </div>
     <div class="player-clock" id="top-time">3:00</div>
@@ -959,7 +961,7 @@ function onDrop(source, target) {
   const move = game.move({ from: source, to: target, promotion: 'q' });
   if (move === null) return 'snapback';
 
-  document.getElementById('status').textContent = 'Bot is thinking…';
+  document.getElementById('status').textContent = 'Alan Dai is thinking…';
   submitMove(move.from + move.to + (move.promotion || ''));
 }
 
@@ -1000,7 +1002,7 @@ $(document).on('click', '#board', function(e) {
     if (mv) {
       clearSelection();
       board.position(game.fen()); applyHighlights(null);
-      document.getElementById('status').textContent = 'Bot is thinking…';
+      document.getElementById('status').textContent = 'Alan Dai is thinking…';
       submitMove(mv.from + mv.to + (mv.promotion || ''));
     } else if (own) {
       // Re-select a different own piece
@@ -1025,7 +1027,7 @@ function submitMove(uci) {
 }
 
 function triggerBotMove() {
-  document.getElementById('status').textContent = 'Bot is thinking…';
+  document.getElementById('status').textContent = 'Alan Dai is thinking…';
   fetch('/bot_move', { method: 'POST' }).then(r => r.json()).then(handleStateUpdate);
 }
 
@@ -1056,7 +1058,7 @@ function handleStateUpdate(data) {
       document.getElementById('status').textContent = 'Your turn';
     } else {
       board.position(game.fen(), true);
-      document.getElementById('status').textContent = 'Bot is thinking…';
+      document.getElementById('status').textContent = 'Alan Dai is thinking…';
       submitMove(pm.from + pm.to + (mv.promotion || ''));
     }
   } else {
@@ -1138,7 +1140,7 @@ function initBoard(data) {
   clearPremove();
   clearSelection();
 
-  document.getElementById('top-name').textContent    = 'Bot';
+  document.getElementById('top-name').textContent    = 'Alan Dai';
   document.getElementById('top-sub').textContent     = botColor === 'black' ? 'Black' : 'White';
   document.getElementById('top-avatar').textContent  = botColor === 'black' ? '♟' : '♙';
   document.getElementById('bottom-name').textContent = 'You';
@@ -1162,7 +1164,7 @@ function initBoard(data) {
   updateMoveList(data.moves);
   applyHighlights(data);
   setGameButtons(false);
-  document.getElementById('status').textContent = data.turn === humanColor ? 'Your turn' : 'Bot is thinking…';
+  document.getElementById('status').textContent = data.turn === humanColor ? 'Your turn' : 'Alan Dai is thinking…';
 }
 
 function setGameButtons(over) {
@@ -1352,7 +1354,7 @@ function renderBotGamesList(games) {
     html += `<div class="game-row" onclick="openGameViewer(bgGameData[${i}])">
       <div class="result-badge result-${rc}">${rc}</div>
       <div class="game-info">
-        <div class="game-opp">vs Bot</div>
+        <div class="game-opp">vs Alan Dai</div>
         <div class="game-opening">${g.result_text || ''}</div>
       </div>
       <div class="game-meta">${icon} ${g.time_class}<br>${g.date}</div>
@@ -1664,7 +1666,7 @@ def resign():
         if state.get("over"):
             return jsonify({"error": "Game is already over."})
         state["over"]   = True
-        state["result"] = "You resigned — bot wins!"
+        state["result"] = "You resigned — Alan Dai wins!"
         _save_local_game(state)
         return jsonify(_board_json(state))
 

@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+.env
 local_games.json
 *.pgn
