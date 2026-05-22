@@ -1,11 +1,11 @@
 import chess
 import random
 import shutil
-import torch
+import numpy as np
+import onnxruntime as ort
 from typing import Optional
 
-from model import ChessNet
-from dataset import board_to_tensor, move_to_index, flip_move, NUM_ACTIONS
+from .board_features import board_to_tensor, move_to_index, flip_move
 from .time_manager import TimeManager
 from .opening_book import OpeningBook
 from .time_pressure import TimePressureHandler
@@ -14,12 +14,6 @@ from .stockfish_filter import StockfishFilter
 from . import tactic_weights
 
 
-def _default_device() -> torch.device:
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
 
 
 _MATERIAL_VALUE = {
@@ -90,19 +84,20 @@ class ChessBotEngine:
         model_path: str,
         username: str = "yuandan",
         opening_book_path: str = "opening_book.json",
-        device: Optional[torch.device] = None,
+        device: Optional[str] = None,
         stockfish_path: str = "",
     ):
-        self.device = device or _default_device()
-        torch.set_num_threads(1)  # prevent PyTorch spawning extra threads on single-core containers
+        self.device = "cpu"
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        self.session = ort.InferenceSession(
+            model_path, sess_options=opts, providers=["CPUExecutionProvider"]
+        )
 
         self.time_manager = TimeManager(time_control)
         self.opening_book = OpeningBook(opening_book_path, username)
         self.time_pressure = TimePressureHandler()
-
-        self.model = ChessNet(num_actions=NUM_ACTIONS).to(self.device)
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
-        self.model.eval()
 
         # Exposed after each get_move() call so the UI can compute think delays.
         self.last_gap_cp: Optional[int] = None
@@ -264,19 +259,15 @@ class ChessBotEngine:
         temperature: float = 1.0,
         allowed_moves=None,
     ) -> chess.Move:
-        # Canonicalize to user's-pieces-at-bottom perspective, matching training.
         canonical_flip = (board.turn == chess.BLACK)
-        tensor = board_to_tensor(board, flip=canonical_flip).unsqueeze(0).float()
-        tensor[0, 20] /= 100.0  # normalize 50-move clock to [0, 1] (matches training)
-        tensor = tensor.to(self.device)
-        with torch.no_grad():
-            policy_logits, _ = self.model(tensor)
-        logits = policy_logits[0]
+        arr = board_to_tensor(board, flip=canonical_flip).astype(np.float32)
+        arr = arr[np.newaxis]          # add batch dim → (1, 21, 8, 8)
+        arr[0, 20] /= 100.0           # normalize 50-move clock
+        policy_logits, _ = self.session.run(None, {"input": arr})
+        logits = policy_logits[0]     # shape (NUM_ACTIONS,)
 
         legal_moves = list(board.legal_moves)
 
-        # Restrict to Stockfish-approved moves when provided. This keeps yuandan's
-        # stylistic choices but prevents the net from wandering into blunder territory.
         if allowed_moves:
             allowed_set = set(allowed_moves)
             filtered = [m for m in legal_moves if m in allowed_set]
@@ -284,19 +275,20 @@ class ChessBotEngine:
                 legal_moves = filtered
 
         if canonical_flip:
-            indices = torch.tensor([flip_move(m) for m in legal_moves], device=self.device)
+            indices = np.array([flip_move(m) for m in legal_moves])
         else:
-            indices = torch.tensor([move_to_index(m) for m in legal_moves], device=self.device)
+            indices = np.array([move_to_index(m) for m in legal_moves])
         legal_logits = logits[indices]
 
-        probs = torch.softmax(legal_logits / temperature, dim=0)
+        # Softmax with temperature
+        shifted = (legal_logits - legal_logits.max()) / temperature
+        exp = np.exp(shifted)
+        probs = exp / exp.sum()
 
-        # Blunder filter: reject candidates that leave any piece worth ≥3 en prise.
-        # Samples up to 8 times; if all samples hang a piece, falls back to a greedy
-        # scan of the full sorted logit list so we never return a hanging move.
-        best = int(torch.argmax(probs).item())  # greedy fallback if all samples fail
+        # Blunder filter: sample up to 8 times, fall back to greedy if all hang a piece
+        best = int(np.argmax(probs))
         for _ in range(8):
-            candidate = int(torch.multinomial(probs, 1).item())
+            candidate = int(np.random.choice(len(probs), p=probs))
             if not self._hangs_piece(board, legal_moves[candidate]):
                 best = candidate
                 break
@@ -306,8 +298,7 @@ class ChessBotEngine:
                 break
             probs = probs / total
         else:
-            # 8 samples all hung pieces — walk sorted logits to find the first safe move
-            for idx in torch.argsort(legal_logits, descending=True).tolist():
+            for idx in np.argsort(legal_logits)[::-1].tolist():
                 if not self._hangs_piece(board, legal_moves[idx]):
                     best = idx
                     break

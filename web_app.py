@@ -19,7 +19,7 @@ from bot.think_timer import ThinkTimer
 app = Flask(__name__)
 
 USERNAME         = os.environ.get("CHESS_USERNAME", os.environ.get("USERNAME", "yuandan"))
-MODEL_PATH       = os.environ.get("MODEL_PATH",       "best_model.pt")
+MODEL_PATH       = os.environ.get("MODEL_PATH",       "best_model.onnx")
 BOOK_PATH        = os.environ.get("BOOK_PATH",        "opening_book.json")
 _sf_env = os.environ.get("STOCKFISH_PATH", "")
 STOCKFISH_PATH   = (

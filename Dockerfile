@@ -11,8 +11,7 @@ WORKDIR /app
 
 # Install Python deps — CPU-only torch to keep image small and memory low
 COPY requirements.txt .
-RUN pip install --no-cache-dir flask gunicorn python-chess requests numpy python-dotenv \
-    && pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir flask gunicorn python-chess requests numpy python-dotenv onnxruntime
 
 # Copy source + data files (model, opening book)
 COPY . .
