@@ -859,7 +859,10 @@ function onDragStart(source, piece) {
   if (humanColor === 'black' && piece[0] === 'w') return false;
   document.body.classList.add('is-dragging');
   clearSelection();
-  $(`#board .square-${source}`).addClass('sq-sel'); // highlight dragged piece only (no dots — they'd flash and vanish)
+  if (game.turn() === humanColor[0]) {
+    showLegalDots(source);
+    $(`#board .square-${source}`).addClass('sq-sel');
+  }
 }
 
 function onDrop(source, target) {
