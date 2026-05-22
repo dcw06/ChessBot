@@ -591,8 +591,9 @@ HTML = r"""<!DOCTYPE html>
   #action-row { display: flex; gap: 8px; width: 100%; margin-top: 10px; }
 
   /* ── Square highlights ─────────────────────────────────────────────── */
-  #board .sq-last    { background-color: rgba(170, 162, 58, 0.50) !important; }
-  #board .sq-sel     { background-color: rgba(20,  130, 20, 0.50) !important; }
+  #board .sq-last    { background-color: rgba(205, 195, 45, 0.62) !important; }
+  #board .sq-sel     { background-color: rgba(20, 130, 20, 0.52) !important;
+                       animation: sel-pulse 1.4s ease-in-out infinite; }
   #board .sq-check   { background: radial-gradient(ellipse at center,
                          rgba(255,0,0,0.88) 0%, rgba(231,0,0,0.38) 55%,
                          transparent 100%) !important; }
@@ -601,21 +602,41 @@ HTML = r"""<!DOCTYPE html>
   /* ── Legal-move indicators ─────────────────────────────────────────── */
   .legal-dot {
     position: absolute;
-    width: 32%; height: 32%;
-    background: rgba(0, 0, 0, 0.18);
+    width: 30%; height: 30%;
+    background: rgba(0, 0, 0, 0.22);
     border-radius: 50%;
     top: 50%; left: 50%;
     transform: translate(-50%, -50%);
     pointer-events: none;
     z-index: 10;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.25);
   }
   .legal-ring {
     position: absolute;
     width: 100%; height: 100%;
-    box-shadow: inset 0 0 0 6px rgba(0, 0, 0, 0.18);
+    box-shadow: inset 0 0 0 5px rgba(0, 0, 0, 0.22);
     top: 0; left: 0;
     pointer-events: none;
     z-index: 10;
+    border-radius: 2px;
+  }
+
+  /* ── Piece drag aesthetics ─────────────────────────────────────────── */
+  #board img, #av-board img {
+    cursor: grab;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  /* Dragged ghost piece (appended to <body> by chessboard.js during drag) */
+  body.is-dragging > img {
+    filter: drop-shadow(0 10px 24px rgba(0,0,0,0.70)) brightness(1.06) !important;
+    cursor: grabbing !important;
+    z-index: 9999 !important;
+  }
+  /* Pulse animation for selected square */
+  @keyframes sel-pulse {
+    0%, 100% { filter: brightness(1.0); }
+    50%       { filter: brightness(1.35); }
   }
 
   /* ── Analyze sub-nav ─────────────────────────────────────────────────── */
@@ -643,8 +664,9 @@ HTML = r"""<!DOCTYPE html>
 
   /* ── Analysis: compact board + player strips ─────────────────────────── */
   #av-board-wrap { max-width: 360px; }
-  #av-board .sq-sel  { background-color: rgba(20, 130, 20, 0.50) !important; }
-  #av-board .sq-last { background-color: rgba(170, 162, 58, 0.50) !important; }
+  #av-board .sq-sel  { background-color: rgba(20, 130, 20, 0.52) !important;
+                       animation: sel-pulse 1.4s ease-in-out infinite; }
+  #av-board .sq-last { background-color: rgba(205, 195, 45, 0.62) !important; }
   #av-top-strip, #av-bottom-strip { padding: 3px 6px; }
   #av-top-strip .player-avatar,
   #av-bottom-strip .player-avatar  { width: 24px; height: 24px; font-size: 0.88rem; }
@@ -931,6 +953,7 @@ function onDragStart(source, piece) {
   if (gameOver) return false;
   if (humanColor === 'white' && piece[0] === 'b') return false;
   if (humanColor === 'black' && piece[0] === 'w') return false;
+  document.body.classList.add('is-dragging');
   clearSelection();
   // Show hints during drag only on our turn (premove drag gets no dots)
   if (game.turn() === humanColor[0]) {
@@ -942,6 +965,7 @@ function onDragStart(source, piece) {
 function onDrop(source, target) {
   clearLegalDots();
   $('#board .sq-sel').removeClass('sq-sel');
+  document.body.classList.remove('is-dragging');
 
   // Prevent the click event that the browser fires right after mouseup
   _justDropped = true;
@@ -967,6 +991,7 @@ function onDrop(source, target) {
 
 function onSnapEnd() {
   clearLegalDots();
+  document.body.classList.remove('is-dragging');
   if (!premove) { board.position(game.fen()); applyHighlights(null); }
 }
 
@@ -1149,15 +1174,18 @@ function initBoard(data) {
 
   if (board) board.destroy();
   board = Chessboard('board', {
-    position:     data.fen,
-    orientation:  humanColor,
-    draggable:    true,
-    showNotation: true,
+    position:        data.fen,
+    orientation:     humanColor,
+    draggable:       true,
+    showNotation:    true,
+    moveSpeed:       180,
+    snapSpeed:       70,
+    snapbackSpeed:   260,
     onDragStart,
     onDrop,
     onSnapEnd,
-    onMoveEnd:    () => applyHighlights(null),
-    pieceTheme:   'https://chessboardjs.com/img/chesspieces/wikipedia/{piece}.png',
+    onMoveEnd:       () => applyHighlights(null),
+    pieceTheme:      'https://chessboardjs.com/img/chesspieces/wikipedia/{piece}.png',
   });
 
   updateClocks(data);
@@ -1402,14 +1430,17 @@ function openGameViewer(g) {
   const orient = g.user_color;
   if (avBoard) avBoard.destroy();
   avBoard = Chessboard('av-board', {
-    position:     'start',
-    orientation:  orient,
-    draggable:    true,
-    showNotation: true,
-    onDragStart:  () => true,        // allow dragging any piece in analysis
-    onDrop:       avOnDrop,
-    onSnapEnd:    avOnSnapEnd,
-    pieceTheme:   'https://chessboardjs.com/img/chesspieces/wikipedia/{piece}.png',
+    position:        'start',
+    orientation:     orient,
+    draggable:       true,
+    showNotation:    true,
+    moveSpeed:       180,
+    snapSpeed:       70,
+    snapbackSpeed:   260,
+    onDragStart:     () => { document.body.classList.add('is-dragging'); return true; },
+    onDrop:          avOnDrop,
+    onSnapEnd:       avOnSnapEnd,
+    pieceTheme:      'https://chessboardjs.com/img/chesspieces/wikipedia/{piece}.png',
   });
 
   renderAvMoveList();
@@ -1466,6 +1497,7 @@ function avClearVariation() {
 // ── Analysis drag-and-drop ─────────────────────────────────────────────────
 
 function avOnDrop(source, target) {
+  document.body.classList.remove('is-dragging');
   if (source === target) return 'snapback';
   avClearAvSel();
   const move = avViewer.move({ from: source, to: target, promotion: 'q' });
@@ -1476,6 +1508,7 @@ function avOnDrop(source, target) {
 }
 
 function avOnSnapEnd() {
+  document.body.classList.remove('is-dragging');
   avBoard.position(avViewer.fen());
 }
 
