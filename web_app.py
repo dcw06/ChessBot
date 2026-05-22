@@ -746,7 +746,8 @@ let pollInterval, clockInterval;
 let gameOver    = false;
 let premove     = null;   // {from, to} queued during bot's turn
 let selSquare   = null;   // currently click-selected square ("e2" etc.)
-let _justDropped = false; // suppress click event that fires right after a drag-drop
+let _justDropped = false;  // suppress click event that fires right after a drag-drop
+let _pendingSelect = null; // square to re-select after snapback re-renders the board
 let _lastData    = null;  // most recent server state — re-applied after board re-renders
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -875,7 +876,13 @@ function onDrop(source, target) {
   setTimeout(() => { _justDropped = false; }, 80);
 
   if (gameOver) return 'snapback';
-  if (source === target) return 'snapback';
+  if (source === target) {
+    const pieceObj = game.get(source);
+    if (pieceObj && isOwnPiece(pieceObj.color + pieceObj.type.toUpperCase())) {
+      _pendingSelect = source; // re-select after snapback re-renders the board
+    }
+    return 'snapback';
+  }
 
   if (game.turn() !== humanColor[0]) {
     // Bot's turn → queue premove
@@ -896,6 +903,7 @@ function onSnapEnd() {
   clearLegalDots();
   document.body.classList.remove('is-dragging');
   if (!premove) { board.position(game.fen()); applyHighlights(null); }
+  if (_pendingSelect) { const sq = _pendingSelect; _pendingSelect = null; selectSquare(sq); }
 }
 
 // ── Click-to-move ──────────────────────────────────────────────────────────
