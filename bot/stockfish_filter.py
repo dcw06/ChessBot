@@ -3,7 +3,7 @@ import chess.engine
 from typing import Optional, List
 
 
-DEFAULT_TIME_LIMIT = 0.02  # 20ms — shallower search, misses subtle tactics like a human would
+DEFAULT_TIME_LIMIT = 0.04  # 40ms — deep enough to catch most one/two-move tactics
 
 # Moves within this many centipawns of best are considered "acceptable" choices.
 # The neural net then picks among them to preserve yuandan's style.

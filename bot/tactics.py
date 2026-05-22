@@ -256,14 +256,20 @@ def find_tactical_move(board: chess.Board) -> TacticResult:
     Check for high-priority tactics in order:
       1. Mate in 1
       2. Back-rank pressure (check against a trapped king with few escapes)
-      3. Fork winning material
-      4. Capture a pinned piece (only when exchange is favorable)
+      3. Fork winning material (any piece, including piece can be taken if net positive)
+      4. Pawn fork (pawn push attacking two pieces worth ≥ 3)
+      5. Skewer (attack high-value piece; capture what hides behind it)
+      6. Discovered attack (reveal a slider's attack on a high-value piece)
+      7. Capture a pinned piece (only when exchange is favorable)
     Returns (move, tactic_key) so the engine can look up the per-tactic weight.
     """
     for finder, name in (
         (_mate_in_1,            "mate_in_1"),
         (_back_rank_threat,     "back_rank"),
         (_fork,                 "fork"),
+        (_pawn_fork,            "pawn_fork"),
+        (_skewer,               "skewer"),
+        (_discovered_attack,    "discovery"),
         (_capture_pinned_piece, "absolute_pin"),
     ):
         m = finder(board)
@@ -321,8 +327,10 @@ def _back_rank_threat(board: chess.Board) -> Optional[chess.Move]:
 
 def _fork(board: chess.Board) -> Optional[chess.Move]:
     """
-    Find a move that attacks two or more opponent pieces worth ≥ 3 with the moved piece,
-    where the moved piece itself is not hanging after the move.
+    Find a move that attacks two or more opponent pieces worth ≥ 3.
+    Allows forks where the forking piece can be taken, as long as the net
+    material gain is still positive (e.g. knight can be captured by pawn but
+    the fork wins a rook+bishop → net +5, clearly worth it).
     """
     opponent = not board.turn
     best_move = None
@@ -333,8 +341,6 @@ def _fork(board: chess.Board) -> Optional[chess.Move]:
             continue
 
         board.push(move)
-        # Use board.attacks() to get only the squares our piece actually covers — O(attacked)
-        # instead of scanning all 64 squares.
         forked_value = 0
         forked_count = 0
         for sq in board.attacks(move.to_square):
@@ -345,10 +351,186 @@ def _fork(board: chess.Board) -> Optional[chess.Move]:
             if target_val >= 3:
                 forked_value += target_val
                 forked_count += 1
+
+        if forked_count >= 2:
+            our_piece = board.piece_at(move.to_square)
+            our_val = PIECE_VALUE.get(our_piece.piece_type, 0) if our_piece else 0
+            is_attacked = board.is_attacked_by(board.turn, move.to_square)
+            if is_attacked:
+                if not board.is_attacked_by(not board.turn, move.to_square):
+                    net_gain = forked_value - our_val   # undefended — we lose the piece
+                else:
+                    # Defended: see if cheapest attacker beats us
+                    min_att = min(
+                        PIECE_VALUE.get(board.piece_type_at(a), 99)
+                        for a in board.attackers(board.turn, move.to_square)
+                        if board.piece_at(a)
+                    )
+                    net_gain = forked_value - our_val if min_att < our_val else forked_value
+            else:
+                net_gain = forked_value  # safe fork
+
+            board.pop()
+            if net_gain > 0 and net_gain > best_gain:
+                best_gain = net_gain
+                best_move = move
+        else:
+            board.pop()
+
+    return best_move
+
+
+def _skewer(board: chess.Board) -> Optional[chess.Move]:
+    """
+    Give check with a sliding piece where a valuable enemy piece hides behind the
+    king on the same ray.  The king MUST move (it's in check), letting us then
+    capture the piece that was sheltering behind it.
+    """
+    best_move = None
+    best_gain = 0
+    SLIDING = {chess.BISHOP, chess.ROOK, chess.QUEEN}
+
+    for move in board.legal_moves:
+        if board.piece_type_at(move.from_square) not in SLIDING:
+            continue
+
+        board.push(move)
+        if not board.is_check():
+            board.pop()
+            continue
+
+        # King is in check — find it (board.turn is now the side in check)
+        king_sq = board.king(board.turn)
+        if king_sq is None:
+            board.pop()
+            continue
+
+        pt_at_dest = board.piece_type_at(move.to_square)
+        ff, fr = chess.square_file(move.to_square), chess.square_rank(move.to_square)
+        kf, kr = chess.square_file(king_sq), chess.square_rank(king_sq)
+        df = (1 if kf > ff else -1 if kf < ff else 0)
+        dr = (1 if kr > fr else -1 if kr < fr else 0)
+        if pt_at_dest == chess.BISHOP and df * dr == 0:
+            board.pop(); continue
+        if pt_at_dest == chess.ROOK and df * dr != 0:
+            board.pop(); continue
+
+        # Walk behind the king along the same ray
+        f, r = kf + df, kr + dr
+        behind_val = 0
+        while 0 <= f < 8 and 0 <= r < 8:
+            sq = chess.square(f, r)
+            p = board.piece_at(sq)
+            if p is not None:
+                if p.color == board.turn:  # opponent's piece — capturable
+                    behind_val = PIECE_VALUE.get(p.piece_type, 0)
+                break
+            f += df; r += dr
+
+        # Only valid when the king can't simply take our checking piece for free.
+        # (If our piece is adjacent to the king and undefended, the king takes it.)
+        piece_defended = board.is_attacked_by(not board.turn, move.to_square)
+        king_adjacent  = chess.square_distance(king_sq, move.to_square) == 1
+        if king_adjacent and not piece_defended:
+            board.pop()
+            continue
+
+        board.pop()
+        if behind_val > best_gain:
+            best_gain = behind_val
+            best_move = move
+
+    return best_move
+
+
+def _sq_between(a: int, c: int, b: int) -> bool:
+    """True if square c lies strictly between a and b on the same rank/file/diagonal."""
+    af, ar = chess.square_file(a), chess.square_rank(a)
+    bf, br = chess.square_file(b), chess.square_rank(b)
+    cf, cr = chess.square_file(c), chess.square_rank(c)
+    if ar == br == cr:               # same rank
+        return min(af, bf) < cf < max(af, bf)
+    if af == bf == cf:               # same file
+        return min(ar, br) < cr < max(ar, br)
+    if abs(af - bf) == abs(ar - br) and abs(af - cf) == abs(ar - cr):  # same diagonal
+        return min(af, bf) < cf < max(af, bf)
+    return False
+
+
+def _discovered_attack(board: chess.Board) -> Optional[chess.Move]:
+    """
+    Move a piece that was blocking one of our sliding pieces, revealing an attack
+    on a high-value enemy piece.  Only counts as a discovery if the revealed slider
+    now attacks a target worth ≥ 5 that it couldn't reach before (because the moving
+    piece was on the line between them).
+    """
+    best_move = None
+    best_gain = 0
+    SLIDING = {chess.BISHOP, chess.ROOK, chess.QUEEN}
+
+    for move in board.legal_moves:
+        board.push(move)
+        us = not board.turn
+        them = board.turn
+
+        discovered_gain = 0
+        for slider_sq, slider in board.piece_map().items():
+            if slider.color != us or slider.piece_type not in SLIDING:
+                continue
+            if slider_sq == move.to_square:
+                continue  # skip the piece that actually moved
+            for target_sq in board.attacks(slider_sq):
+                target = board.piece_at(target_sq)
+                if target is None or target.color != them:
+                    continue
+                val = 999 if target.piece_type == chess.KING else PIECE_VALUE.get(target.piece_type, 0)
+                if val < 5:
+                    continue
+                # Was the moving piece blocking this line before the move?
+                if _sq_between(slider_sq, move.from_square, target_sq):
+                    discovered_gain = max(discovered_gain, val)
+
+        board.pop()
+
+        if discovered_gain > best_gain:
+            best_gain = discovered_gain
+            best_move = move
+
+    return best_move
+
+
+def _pawn_fork(board: chess.Board) -> Optional[chess.Move]:
+    """
+    Push a pawn to a square where it attacks two opponent pieces worth ≥ 3.
+    The pawn itself must not be immediately capturable after the push.
+    """
+    opponent = not board.turn
+    best_move = None
+    best_gain = 0
+
+    for move in board.legal_moves:
+        if board.piece_type_at(move.from_square) != chess.PAWN:
+            continue
+        if move.to_square == move.from_square:
+            continue
+
+        board.push(move)
+        us = not board.turn
+        # After the pawn push, collect what it attacks
+        forked_value = 0
+        forked_count = 0
+        for sq in board.attacks(move.to_square):
+            target = board.piece_at(sq)
+            if not (target and target.color == opponent):
+                continue
+            val = 999 if target.piece_type == chess.KING else PIECE_VALUE.get(target.piece_type, 0)
+            if val >= 3:
+                forked_value += val
+                forked_count += 1
         is_hanging = board.is_attacked_by(board.turn, move.to_square)
         board.pop()
 
-        if forked_count >= 2 and forked_value > best_gain and not is_hanging:
+        if forked_count >= 2 and not is_hanging and forked_value > best_gain:
             best_gain = forked_value
             best_move = move
 
