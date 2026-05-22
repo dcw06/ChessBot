@@ -960,7 +960,15 @@ function triggerBotMove() {
 }
 
 function handleStateUpdate(data) {
-  if (data.error) { document.getElementById('status').textContent = data.error; return; }
+  if (data.error) {
+    document.getElementById('status').textContent = data.error;
+    if (data.error === 'No game in progress.') {
+      gameOver = true;
+      clearInterval(pollInterval); clearInterval(clockInterval);
+      setGameButtons(true);
+    }
+    return;
+  }
   game.load(data.fen);
   board.position(data.fen, true);
   updateClocks(data);
