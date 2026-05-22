@@ -907,8 +907,10 @@ function onSnapEnd() {
 }
 
 // ── Click-to-move ──────────────────────────────────────────────────────────
+// Use capture phase so the handler fires before chessboard.js can stop propagation.
+// Wired up once after the board div exists; survives board.destroy()/reinit.
 
-$(document).on('click', '#board', function(e) {
+function _boardClickHandler(e) {
   if (_justDropped || gameOver) return;
 
   const sq = squareFromEl(e.target);
@@ -919,11 +921,9 @@ $(document).on('click', '#board', function(e) {
   const own       = isOwnPiece(pieceCode);
 
   if (selSquare) {
-    // Already have a piece selected
     if (selSquare === sq) { clearSelection(); return; }
 
     if (game.turn() !== humanColor[0]) {
-      // Bot's turn: handle premove via click
       if (own) { clearSelection(); selectSquare(sq); }
       else {
         setPremove(selSquare, sq);
@@ -933,7 +933,6 @@ $(document).on('click', '#board', function(e) {
       return;
     }
 
-    // Our turn: try to move
     const mv = game.move({ from: selSquare, to: sq, promotion: 'q' });
     if (mv) {
       clearSelection();
@@ -941,16 +940,16 @@ $(document).on('click', '#board', function(e) {
       document.getElementById('status').textContent = 'Alan Dai is thinking…';
       submitMove(mv.from + mv.to + (mv.promotion || ''));
     } else if (own) {
-      // Re-select a different own piece
-      clearSelection();
-      selectSquare(sq);
+      clearSelection(); selectSquare(sq);
     } else {
       clearSelection();
     }
   } else {
     if (own) selectSquare(sq);
   }
-});
+}
+
+document.getElementById('board').addEventListener('click', _boardClickHandler, true);
 
 // ── Server communication ───────────────────────────────────────────────────
 
