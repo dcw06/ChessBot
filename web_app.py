@@ -1523,6 +1523,8 @@ def abort():
 def human_move():
     uci = request.json.get("uci", "")
     with _lock:
+        if "board" not in state:
+            return jsonify({"error": "No game in progress."}), 400
         if state.get("over"):
             return jsonify({"error": "Game is over."})
         board: chess.Board = state["board"]
@@ -1552,6 +1554,8 @@ def bot_move():
     # Phase 1: compute the move quickly, then release the lock so the UI
     # can keep polling /state (and ticking the clock) during the think delay.
     with _lock:
+        if "board" not in state:
+            return jsonify({"error": "No game in progress."}), 400
         if state.get("over"):
             return jsonify(_board_json(state))
         board: chess.Board = state["board"]
