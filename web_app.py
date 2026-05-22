@@ -22,9 +22,11 @@ USERNAME         = os.environ.get("USERNAME",         "yuandan")
 MODEL_PATH       = os.environ.get("MODEL_PATH",       "best_model.pt")
 BOOK_PATH        = os.environ.get("BOOK_PATH",        "opening_book.json")
 LOCAL_GAMES_FILE = os.environ.get("LOCAL_GAMES_FILE", "local_games.json")
-STOCKFISH_PATH   = (os.environ.get("STOCKFISH_PATH")
-                    or shutil.which("stockfish")
-                    or "/usr/games/stockfish")
+_sf_env = os.environ.get("STOCKFISH_PATH", "")
+STOCKFISH_PATH   = (
+    _sf_env if _sf_env and os.path.isfile(_sf_env)
+    else shutil.which("stockfish") or "/usr/games/stockfish"
+)
 
 TIME_CONTROLS = {
     "bullet": 60,
