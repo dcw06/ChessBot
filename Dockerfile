@@ -1,5 +1,7 @@
 FROM python:3.11-slim
 
+ENV PYTHONUNBUFFERED=1
+
 # Install Stockfish from apt
 RUN apt-get update \
     && apt-get install -y --no-install-recommends stockfish \

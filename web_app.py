@@ -1795,6 +1795,28 @@ def get_state():
         return jsonify(_board_json(state))
 
 
+@app.route("/debug")
+def debug():
+    info = {
+        "stockfish_path": STOCKFISH_PATH,
+        "stockfish_exists": os.path.isfile(STOCKFISH_PATH) if STOCKFISH_PATH else False,
+        "stockfish_which": shutil.which("stockfish"),
+        "model_path": MODEL_PATH,
+        "model_exists": os.path.isfile(MODEL_PATH),
+    }
+    with _lock:
+        if state:
+            engine = state.get("engine")
+            info["engine_loaded"] = engine is not None
+            if engine:
+                info["stockfish_enabled"] = engine.stockfish is not None
+                info["last_gap_cp"] = engine.last_gap_cp
+                info["device"] = str(engine.device)
+        else:
+            info["engine_loaded"] = False
+    return jsonify(info)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
     print(f"Open http://localhost:{port} in your browser")
