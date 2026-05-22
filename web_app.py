@@ -866,23 +866,30 @@ function onDragStart(source, piece) {
 }
 
 function onDrop(source, target) {
-  clearLegalDots();
-  $('#board .sq-sel').removeClass('sq-sel');
   document.body.classList.remove('is-dragging');
 
-  // Prevent the click event that the browser fires right after mouseup
+  // Prevent the click event that fires right after mouseup
   _justDropped = true;
   setTimeout(() => { _justDropped = false; }, 80);
 
-  if (gameOver) return 'snapback';
+  if (gameOver) { clearLegalDots(); $('#board .sq-sel').removeClass('sq-sel'); return 'snapback'; }
+
   if (source === target) {
+    // Click-release: dots and sq-sel are already showing from onDragStart — keep them.
+    // Just lock in the logical selection so destination clicks work immediately.
     const pieceObj = game.get(source);
     if (pieceObj && isOwnPiece(pieceObj.color + pieceObj.type.toUpperCase())) {
-      selSquare = source;       // set immediately so destination clicks in the snapback window work
-      _pendingSelect = source;  // re-apply CSS after the board re-renders in onSnapEnd
+      selSquare = source;
+      _pendingSelect = source; // re-apply after onSnapEnd in case board re-renders
+    } else {
+      clearLegalDots();
+      $('#board .sq-sel').removeClass('sq-sel');
     }
     return 'snapback';
   }
+
+  clearLegalDots();
+  $('#board .sq-sel').removeClass('sq-sel');
 
   if (game.turn() !== humanColor[0]) {
     // Bot's turn → queue premove
