@@ -1,0 +1,6 @@
+python-chess>=1.999
+torch>=2.0
+requests>=2.28
+numpy>=1.24
+flask>=3.0
+gunicorn>=21.0
