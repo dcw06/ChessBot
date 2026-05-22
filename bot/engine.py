@@ -109,8 +109,8 @@ class ChessBotEngine:
 
         resolved = stockfish_path or shutil.which("stockfish") or "/usr/games/stockfish"
         try:
-            self.stockfish = StockfishFilter(resolved, threshold_cp=200)
-            print(f"[ChessBotEngine] Stockfish enabled (threshold=200cp, time=40ms)")
+            self.stockfish = StockfishFilter(resolved, threshold_cp=400)
+            print(f"[ChessBotEngine] Stockfish enabled (threshold=400cp, time=20ms)")
         except Exception:
             self.stockfish = None
             print(f"[ChessBotEngine] Stockfish not found — obvious-move filter disabled")
