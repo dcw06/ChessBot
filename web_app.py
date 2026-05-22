@@ -21,7 +21,6 @@ app = Flask(__name__)
 USERNAME         = os.environ.get("CHESS_USERNAME", os.environ.get("USERNAME", "yuandan"))
 MODEL_PATH       = os.environ.get("MODEL_PATH",       "best_model.pt")
 BOOK_PATH        = os.environ.get("BOOK_PATH",        "opening_book.json")
-LOCAL_GAMES_FILE = os.environ.get("LOCAL_GAMES_FILE", "local_games.json")
 _sf_env = os.environ.get("STOCKFISH_PATH", "")
 STOCKFISH_PATH   = (
     _sf_env if _sf_env and os.path.isfile(_sf_env)
@@ -117,61 +116,6 @@ def _check_game_over(s: dict):
     if s["human_clock"] <= 0:
         s["over"] = True
         s["result"] = "You flagged — Alan Dai wins on time!"
-    if s["over"] and not s.get("saved") and "aborted" not in s.get("result", "").lower():
-        _save_local_game(s)
-
-
-# ── Local game saving ──────────────────────────────────────────────────────
-def _save_local_game(s: dict):
-    s["saved"] = True
-    board: chess.Board = s["board"]
-    try:
-        pgn_game  = chess.pgn.Game.from_board(board)
-        engine    = s.get("engine")
-        tc        = engine.time_manager.time_control if engine else "blitz"
-        bot_white = s["bot_color"] == chess.WHITE
-
-        pgn_game.headers["Event"] = "ChessBot"
-        pgn_game.headers["Site"]  = "localhost"
-        pgn_game.headers["Date"]  = datetime.datetime.now().strftime("%Y.%m.%d")
-        pgn_game.headers["White"] = "Alan Dai" if bot_white else USERNAME
-        pgn_game.headers["Black"] = USERNAME   if bot_white else "Alan Dai"
-
-        result_str = s.get("result", "")
-        r = result_str.lower()
-        if "draw" in r:
-            rc = "D"; pgn_result = "1/2-1/2"
-        elif "you win" in r:
-            rc = "W"; pgn_result = "1-0" if not bot_white else "0-1"
-        else:
-            rc = "L"; pgn_result = "1-0" if bot_white else "0-1"
-        pgn_game.headers["Result"] = pgn_result
-
-        exporter = chess.pgn.StringExporter(headers=True, variations=False, comments=False)
-        pgn_text = pgn_game.accept(exporter)
-
-        try:
-            with open(LOCAL_GAMES_FILE) as f:
-                saved = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            saved = []
-
-        saved.insert(0, {
-            "pgn":         pgn_text,
-            "result":      rc,
-            "user_color":  "black" if bot_white else "white",
-            "date":        datetime.datetime.now().strftime("%b %d"),
-            "time_class":  tc,
-            "result_text": result_str,
-            "opponent":    "Alan Dai",
-            "opp_rating":  "",
-            "opening":     "Bot Game",
-            "url":         "",
-        })
-        with open(LOCAL_GAMES_FILE, "w") as f:
-            json.dump(saved[:100], f)
-    except Exception as e:
-        print(f"[save_local_game] {e}")
 
 
 # ── Analysis Stockfish (separate from the game engine) ────────────────────
@@ -265,16 +209,6 @@ def api_eval():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-@app.route("/api/local_games")
-def api_local_games():
-    """Return list of games played against the bot (saved locally)."""
-    try:
-        with open(LOCAL_GAMES_FILE) as f:
-            games = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        games = []
-    return jsonify({"games": games})
 
 
 @app.route("/api/lines", methods=["POST"])
@@ -698,7 +632,6 @@ HTML = r"""<!DOCTYPE html>
 
 <nav id="main-nav">
   <button class="nav-tab active" id="tab-play"    onclick="switchTab('play')">Play</button>
-  <button class="nav-tab"        id="tab-analyze" onclick="switchTab('analyze')">Analyze</button>
 </nav>
 
 <div id="play-section" style="width:100%;display:flex;flex-direction:column;align-items:center;">
@@ -753,51 +686,19 @@ HTML = r"""<!DOCTYPE html>
     <button id="abort-btn"    class="action-btn">Abort</button>
     <button id="resign-btn"   class="action-btn danger">Resign</button>
     <button id="rematch-btn"  class="action-btn primary" style="display:none">Rematch</button>
+    <button id="review-btn"   class="action-btn"         style="display:none">Review</button>
     <button id="new-game-btn" class="action-btn"         style="display:none">New Game</button>
   </div>
 </div><!-- #game-panel -->
 </div><!-- #play-section -->
 
-<!-- ── Analysis section ──────────────────────────────────────────── -->
+<!-- ── Review section ────────────────────────────────────────────── -->
 <div id="analyze-section" style="display:none">
 
-  <!-- Sub-navigation -->
-  <div id="analyze-sub-nav">
-    <button class="nav-tab active" id="tab-ccgames"  onclick="switchAnalyzeTab('ccgames')">Chess.com</button>
-    <button class="nav-tab"        id="tab-botgames" onclick="switchAnalyzeTab('botgames')">Bot Games</button>
-  </div>
-
-  <!-- Games list view -->
-  <div id="av-list-view">
-
-    <!-- Chess.com games -->
-    <div id="ccgames-section">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-        <span style="font-size:1rem;font-weight:600;color:#e8e6e3;">Recent Games — yuandan</span>
-        <button class="action-btn" style="flex:0;padding:6px 16px;" onclick="loadGames()" id="av-load-btn">Load</button>
-      </div>
-      <div id="av-games-list">
-        <div style="color:#666;text-align:center;padding:24px 0;">Click Load to fetch your recent chess.com games.</div>
-      </div>
-    </div>
-
-    <!-- Bot games -->
-    <div id="botgames-section" style="display:none">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-        <span style="font-size:1rem;font-weight:600;color:#e8e6e3;">Bot Games</span>
-        <button class="action-btn" style="flex:0;padding:6px 16px;" onclick="loadBotGames()" id="bg-load-btn">Load</button>
-      </div>
-      <div id="bot-games-list">
-        <div style="color:#666;text-align:center;padding:24px 0;">Click Load to see your saved bot games.</div>
-      </div>
-    </div>
-
-  </div>
-
-  <!-- Game viewer (hidden until a game is opened) -->
-  <div id="av-game-view" style="display:none;flex-direction:column;align-items:center;gap:0;">
+  <!-- Game viewer -->
+  <div id="av-game-view" style="display:flex;flex-direction:column;align-items:center;gap:0;">
     <div style="width:100%;display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-      <button class="action-btn" style="flex:0;padding:6px 14px;" onclick="closeGameViewer()">← Games</button>
+      <button class="action-btn" style="flex:0;padding:6px 14px;" onclick="switchTab('play')">← Play</button>
       <span id="av-game-title" style="font-size:0.82rem;color:#8a8784;text-align:right;flex:1;padding-left:10px;"></span>
     </div>
     <div id="av-eval-wrap">
@@ -1128,6 +1029,14 @@ document.getElementById('rematch-btn').addEventListener('click', () => {
   startGameWith(_lastTc, _lastBotColor, true);
 });
 
+document.getElementById('review-btn').addEventListener('click', () => {
+  closeGameViewer();
+  const pgn = game ? game.pgn() : '';
+  if (!pgn) return;
+  switchTab('analyze');
+  openGameViewer({ pgn, user_color: humanColor, opponent: 'Alan Dai', opp_rating: '', result: '', time_class: _lastTc || 'blitz' });
+});
+
 document.getElementById('new-game-btn').addEventListener('click', () => {
   clearInterval(pollInterval);
   clearInterval(clockInterval);
@@ -1198,11 +1107,11 @@ function initBoard(data) {
 }
 
 function setGameButtons(over) {
-  document.getElementById('abort-btn').style.display   = over ? 'none' : '';
-  document.getElementById('resign-btn').style.display  = over ? 'none' : '';
-  document.getElementById('rematch-btn').style.display = over ? '' : 'none';
+  document.getElementById('abort-btn').style.display    = over ? 'none' : '';
+  document.getElementById('resign-btn').style.display   = over ? 'none' : '';
+  document.getElementById('rematch-btn').style.display  = over ? '' : 'none';
+  document.getElementById('review-btn').style.display   = over ? '' : 'none';
   document.getElementById('new-game-btn').style.display = over ? '' : 'none';
-  // Abort only valid in first 2 full moves
   if (!over && game) {
     document.getElementById('abort-btn').disabled = game.history().length > 4;
   }
@@ -1286,112 +1195,8 @@ function updateMoveList(moves) {
 
 function switchTab(tab) {
   document.getElementById('play-section').style.display    = tab === 'play'    ? 'flex' : 'none';
-  document.getElementById('analyze-section').style.display = tab === 'analyze' ? 'block' : 'none';
-  document.getElementById('tab-play').classList.toggle('active',    tab === 'play');
-  document.getElementById('tab-analyze').classList.toggle('active', tab === 'analyze');
-}
-
-function switchAnalyzeTab(tab) {
-  document.getElementById('ccgames-section').style.display  = tab === 'ccgames'  ? 'block' : 'none';
-  document.getElementById('botgames-section').style.display = tab === 'botgames' ? 'block' : 'none';
-  document.getElementById('tab-ccgames').classList.toggle('active',  tab === 'ccgames');
-  document.getElementById('tab-botgames').classList.toggle('active', tab === 'botgames');
-}
-
-// ── Analysis: game list ────────────────────────────────────────────────────
-
-function loadGames() {
-  const btn = document.getElementById('av-load-btn');
-  btn.textContent = 'Loading…';
-  btn.disabled = true;
-  document.getElementById('av-games-list').innerHTML =
-    '<div style="color:#8a8784;text-align:center;padding:24px 0;">Fetching from chess.com…</div>';
-
-  fetch('/api/games').then(r => r.json()).then(data => {
-    btn.textContent = 'Refresh';
-    btn.disabled = false;
-    if (data.error) {
-      document.getElementById('av-games-list').innerHTML =
-        `<div style="color:#e57373;padding:16px;">Error: ${data.error}</div>`;
-      return;
-    }
-    renderGamesList(data.games);
-  }).catch(e => {
-    btn.textContent = 'Refresh';
-    btn.disabled = false;
-    document.getElementById('av-games-list').innerHTML =
-      `<div style="color:#e57373;padding:16px;">Network error: ${e.message}</div>`;
-  });
-}
-
-function renderGamesList(games) {
-  if (!games.length) {
-    document.getElementById('av-games-list').innerHTML =
-      '<div style="color:#666;text-align:center;padding:24px 0;">No games found.</div>';
-    return;
-  }
-  const tc_icon = { bullet:'⚡', blitz:'🔥', rapid:'⏱', daily:'📅' };
-  let html = '';
-  games.forEach((g, i) => {
-    const icon = tc_icon[g.time_class] || '';
-    html += `<div class="game-row" onclick="openGameViewer(avGameData[${i}])">
-      <div class="result-badge result-${g.result}">${g.result}</div>
-      <div class="game-info">
-        <div class="game-opp">${g.opponent} <span style="color:#666;font-weight:400">(${g.opp_rating})</span></div>
-        <div class="game-opening">${g.opening}</div>
-      </div>
-      <div class="game-meta">${icon} ${g.time_class}<br>${g.date}</div>
-    </div>`;
-  });
-  document.getElementById('av-games-list').innerHTML = html;
-  window.avGameData = games;  // store for onclick
-}
-
-function loadBotGames() {
-  const btn = document.getElementById('bg-load-btn');
-  btn.textContent = 'Loading…';
-  btn.disabled = true;
-  document.getElementById('bot-games-list').innerHTML =
-    '<div style="color:#8a8784;text-align:center;padding:24px 0;">Loading…</div>';
-  fetch('/api/local_games').then(r => r.json()).then(data => {
-    btn.textContent = 'Refresh';
-    btn.disabled = false;
-    if (data.error) {
-      document.getElementById('bot-games-list').innerHTML =
-        `<div style="color:#e57373;padding:16px;">Error: ${data.error}</div>`;
-      return;
-    }
-    renderBotGamesList(data.games);
-  }).catch(e => {
-    btn.textContent = 'Refresh';
-    btn.disabled = false;
-    document.getElementById('bot-games-list').innerHTML =
-      `<div style="color:#e57373;padding:16px;">Network error: ${e.message}</div>`;
-  });
-}
-
-function renderBotGamesList(games) {
-  if (!games.length) {
-    document.getElementById('bot-games-list').innerHTML =
-      '<div style="color:#666;text-align:center;padding:24px 0;">No bot games saved yet. Play a game first!</div>';
-    return;
-  }
-  const tc_icon = { bullet:'⚡', blitz:'🔥', rapid:'⏱' };
-  let html = '';
-  games.forEach((g, i) => {
-    const icon = tc_icon[g.time_class] || '';
-    const rc = g.result || '?';
-    html += `<div class="game-row" onclick="openGameViewer(bgGameData[${i}])">
-      <div class="result-badge result-${rc}">${rc}</div>
-      <div class="game-info">
-        <div class="game-opp">vs Alan Dai</div>
-        <div class="game-opening">${g.result_text || ''}</div>
-      </div>
-      <div class="game-meta">${icon} ${g.time_class}<br>${g.date}</div>
-    </div>`;
-  });
-  document.getElementById('bot-games-list').innerHTML = html;
-  window.bgGameData = games;
+  document.getElementById('analyze-section').style.display = tab === 'analyze' ? 'flex' : 'none';
+  document.getElementById('tab-play').classList.toggle('active', tab === 'play');
 }
 
 // ── Analysis: game viewer ──────────────────────────────────────────────────
@@ -1405,8 +1210,6 @@ let avSelSquare    = null;         // click-selected square in analysis board
 let avEvalDebounce = null;
 
 function openGameViewer(g) {
-  document.getElementById('av-list-view').style.display = 'none';
-  document.getElementById('av-game-view').style.display = 'flex';
 
   // Parse PGN
   const loader = new Chess();
@@ -1450,8 +1253,6 @@ function openGameViewer(g) {
 }
 
 function closeGameViewer() {
-  document.getElementById('av-game-view').style.display = 'none';
-  document.getElementById('av-list-view').style.display = 'block';
   document.getElementById('av-lines-panel').innerHTML = '';
   avVariation = []; avSelSquare = null;
   if (avBoard) { avBoard.destroy(); avBoard = null; }
@@ -1702,7 +1503,6 @@ def resign():
             return jsonify({"error": "Game is already over."})
         state["over"]   = True
         state["result"] = "You resigned — Alan Dai wins!"
-        _save_local_game(state)
         return jsonify(_board_json(state))
 
 
