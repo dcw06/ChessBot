@@ -94,6 +94,7 @@ class ChessBotEngine:
         stockfish_path: str = "",
     ):
         self.device = device or _default_device()
+        torch.set_num_threads(1)  # prevent PyTorch spawning extra threads on single-core containers
 
         self.time_manager = TimeManager(time_control)
         self.opening_book = OpeningBook(opening_book_path, username)

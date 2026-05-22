@@ -18,4 +18,4 @@ RUN pip install --no-cache-dir flask gunicorn python-chess requests numpy python
 COPY . .
 
 EXPOSE 10000
-CMD gunicorn -w 1 -b 0.0.0.0:${PORT:-10000} web_app:app
+CMD gunicorn -w 1 --timeout 120 -b 0.0.0.0:${PORT:-10000} web_app:app

@@ -57,7 +57,7 @@ class StockfishFilter:
         self.threshold_cp = threshold_cp
         self.time_limit   = time_limit
         self._engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-        self._engine.configure({"Threads": 1, "Hash": 16})
+        self._engine.configure({"Threads": 1, "Hash": 4})
 
     # ------------------------------------------------------------------
 
