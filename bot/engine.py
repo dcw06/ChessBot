@@ -110,7 +110,7 @@ class ChessBotEngine:
         resolved = stockfish_path or shutil.which("stockfish") or "/usr/games/stockfish"
         try:
             self.stockfish = StockfishFilter(resolved, threshold_cp=400)
-            print(f"[ChessBotEngine] Stockfish enabled (threshold=400cp, time=20ms)")
+            print(f"[ChessBotEngine] Stockfish enabled (threshold=450cp, time=20ms)")
         except Exception:
             self.stockfish = None
             print(f"[ChessBotEngine] Stockfish not found — obvious-move filter disabled")
@@ -203,29 +203,25 @@ class ChessBotEngine:
             if random.random() < p:
                 return winning_capture
 
-        # Complexity multiplier: Stockfish gap_cp measures how "forcing" the position is.
-        # Large gap → one move clearly best → tactic is obvious → higher probability.
-        # Small gap → many equal moves → complex position → tactic harder to notice.
-        gap_cp = sf_analysis.gap_cp if sf_analysis is not None else None
-        cmplx  = self._complexity_multiplier(gap_cp)
-
-        # 7. Tactical patterns — base weight × complexity scale from Stockfish.
+        # 7. Tactical patterns — each tactic has its own per-tactic weight from the
+        #    weights table (calibrated to yuandan's historical noticing rate).
+        #    Low-time fallback uses a reduced version of the same weight.
         tactic_result = find_tactical_move(board)
         if tactic_result is not None:
             tactic_move, tactic_name = tactic_result
             if approved(tactic_move):
-                p = min(1.0, tactic_weights.get_weight(tactic_name, self.time_manager.time_control) * cmplx)
+                p = tactic_weights.get_weight(tactic_name, self.time_manager.time_control)
                 if profile.low_time_threshold > 0 and clock_remaining < profile.low_time_threshold:
-                    p *= 0.80
+                    p *= 0.80  # additional miss rate under time pressure
                 if random.random() < p:
                     return tactic_move
 
-        # 8. Positional strategy — same complexity scaling.
+        # 8. Positional strategy — per-tactic weight replaces the broad strategic_probability.
         strategic_result = find_strategic_move(board)
         if strategic_result is not None:
             strategic_move, strategic_name = strategic_result
             if approved(strategic_move):
-                p = min(1.0, tactic_weights.get_weight(strategic_name, self.time_manager.time_control) * cmplx)
+                p = tactic_weights.get_weight(strategic_name, self.time_manager.time_control)
                 if random.random() < p:
                     return strategic_move
 
@@ -238,24 +234,6 @@ class ChessBotEngine:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _complexity_multiplier(gap_cp) -> float:
-        """
-        Convert Stockfish's gap_cp (best move minus 2nd-best, in centipawns) into a
-        probability multiplier for tactic/strategy weights.
-
-        Large gap  = one move is clearly best = forcing/tactical position = tactic easy to spot.
-        Small gap  = many moves roughly equal = complex/quiet position = tactic harder to see.
-
-          gap =   0 cp  →  ×0.65  (very complex, tactic easy to miss)
-          gap = 300 cp  →  ×0.93  (moderate clarity)
-          gap = 500 cp  →  ×1.05  (forcing, tactic hard to miss)
-        """
-        if gap_cp is None:
-            return 1.0
-        t = min(1.0, gap_cp / 500)
-        return 0.65 + 0.40 * t
 
     def _situational_temperature(self, board: chess.Board, base_temp: float) -> float:
         """Scale temperature up for positions where yuandan historically underperforms."""
