@@ -327,10 +327,15 @@ def _back_rank_threat(board: chess.Board) -> Optional[chess.Move]:
 
 def _fork(board: chess.Board) -> Optional[chess.Move]:
     """
-    Find a move that attacks two or more opponent pieces worth ≥ 3.
-    Allows forks where the forking piece can be taken, as long as the net
-    material gain is still positive (e.g. knight can be captured by pawn but
-    the fork wins a rook+bishop → net +5, clearly worth it).
+    Find a move that attacks 2+ opponent pieces worth ≥ 3 with a positive net gain.
+
+    Guaranteed gain is NOT the sum of attacked values — the opponent saves their best
+    piece.  Correct logic:
+      • No check: opponent saves their most valuable piece → we capture the least.
+        guaranteed = min(attacked_values)
+      • King also forked (check): king must move, we pick the best non-king piece.
+        guaranteed = max(attacked_non_king_values)
+    Net gain then subtracts our piece cost when the forking piece can be taken.
     """
     opponent = not board.turn
     best_move = None
@@ -341,41 +346,51 @@ def _fork(board: chess.Board) -> Optional[chess.Move]:
             continue
 
         board.push(move)
-        forked_value = 0
-        forked_count = 0
+
+        king_forked  = False
+        attacked_vals = []
         for sq in board.attacks(move.to_square):
             target = board.piece_at(sq)
             if not (target and target.color == opponent):
                 continue
-            target_val = 999 if target.piece_type == chess.KING else PIECE_VALUE[target.piece_type]
-            if target_val >= 3:
-                forked_value += target_val
-                forked_count += 1
+            if target.piece_type == chess.KING:
+                king_forked = True
+            else:
+                val = PIECE_VALUE.get(target.piece_type, 0)
+                if val >= 3:
+                    attacked_vals.append(val)
 
-        if forked_count >= 2:
+        guaranteed = 0
+        valid = False
+        if king_forked and attacked_vals:
+            guaranteed = max(attacked_vals)   # king must move → take best other piece
+            valid = True
+        elif len(attacked_vals) >= 2:
+            guaranteed = min(attacked_vals)   # opponent saves best → we take least
+            valid = True
+
+        net_gain = 0
+        if valid and guaranteed >= 3:
             our_piece = board.piece_at(move.to_square)
-            our_val = PIECE_VALUE.get(our_piece.piece_type, 0) if our_piece else 0
+            our_val   = PIECE_VALUE.get(our_piece.piece_type, 0) if our_piece else 0
             is_attacked = board.is_attacked_by(board.turn, move.to_square)
             if is_attacked:
                 if not board.is_attacked_by(not board.turn, move.to_square):
-                    net_gain = forked_value - our_val   # undefended — we lose the piece
+                    net_gain = guaranteed - our_val            # undefended: we lose it
                 else:
-                    # Defended: see if cheapest attacker beats us
                     min_att = min(
                         PIECE_VALUE.get(board.piece_type_at(a), 99)
                         for a in board.attackers(board.turn, move.to_square)
                         if board.piece_at(a)
                     )
-                    net_gain = forked_value - our_val if min_att < our_val else forked_value
+                    net_gain = guaranteed - our_val if min_att < our_val else guaranteed
             else:
-                net_gain = forked_value  # safe fork
+                net_gain = guaranteed
 
-            board.pop()
-            if net_gain > 0 and net_gain > best_gain:
-                best_gain = net_gain
-                best_move = move
-        else:
-            board.pop()
+        board.pop()
+        if valid and net_gain > 0 and net_gain > best_gain:
+            best_gain = net_gain
+            best_move = move
 
     return best_move
 
