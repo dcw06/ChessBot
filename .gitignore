@@ -11,3 +11,6 @@ local_games.json
 checkpoint.pt
 analyze_style*.py
 *_analysis.py
+node_modules/
+test-results/
+playwright-report/

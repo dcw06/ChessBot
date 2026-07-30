@@ -17,7 +17,7 @@ import chess
 import chess.engine
 import chess.pgn
 import requests as _requests
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, request, render_template
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from bot.engine import ChessBotEngine, load_model
@@ -95,9 +95,16 @@ _shutdown_event = threading.Event()
 _stockfish_probe_lock = threading.Lock()
 _stockfish_probe_at = 0.0
 _stockfish_probe_ok = STOCKFISH_READY
+_games_cache_lock = threading.Lock()
+_games_cache: dict[str, object] = {"expires": 0.0, "data": None}
 
 
-def _new_state(tc: str, bot_color: str) -> dict:
+def _new_state(
+    tc: str,
+    bot_color: str,
+    total_seconds: float | None = None,
+    increment_seconds: float = 0.0,
+) -> dict:
     bot_side = chess.WHITE if bot_color == "white" else chess.BLACK
     engine = ChessBotEngine(
         time_control=tc,
@@ -107,7 +114,7 @@ def _new_state(tc: str, bot_color: str) -> dict:
         stockfish_path=STOCKFISH_PATH,
         inference_session=MODEL_SESSION,
     )
-    total = float(TIME_CONTROLS[tc])
+    total = float(total_seconds if total_seconds is not None else TIME_CONTROLS[tc])
     return {
         "lock":        threading.RLock(),
         "engine":      engine,
@@ -116,7 +123,7 @@ def _new_state(tc: str, bot_color: str) -> dict:
         "bot_color":   bot_side,
         "bot_clock":   total,
         "human_clock": total,
-        "last_tick":   time.time(),
+        "last_tick":   time.monotonic(),
         "over":        False,
         "result":      None,
         "is_rematch":  False,
@@ -124,6 +131,9 @@ def _new_state(tc: str, bot_color: str) -> dict:
         "last_move":   None,        # (from_sq, to_sq) for highlighting
         "version":     0,
         "bot_busy":    False,
+        "increment":   float(increment_seconds),
+        "snapshots":   [],
+        "decision_source": "—",
         "last_access": time.monotonic(),
     }
 
@@ -149,6 +159,13 @@ def _rate_allowed(bucket: str, limit: int, window_seconds: float) -> bool:
     now = time.monotonic()
     key = (bucket, request.remote_addr or "unknown")
     with _rate_lock:
+        if len(_rate_events) > 4096:
+            oldest = sorted(
+                _rate_events,
+                key=lambda item: _rate_events[item][-1] if _rate_events[item] else 0,
+            )[:1024]
+            for stale_key in oldest:
+                _rate_events.pop(stale_key, None)
         events = _rate_events[key]
         while events and now - events[0] >= window_seconds:
             events.popleft()
@@ -164,6 +181,7 @@ def _request_guards():
         return jsonify({"error": "Cross-origin request rejected."}), 403
     limits = {
         "new_game": (10, 60 * 60),
+        "api_games": (20, 60),
         "api_eval": (30, 60),
         "api_lines": (30, 60),
     }
@@ -183,11 +201,16 @@ def _security_headers(response):
     response.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline'; "
-        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; "
+        "style-src 'self'; style-src-attr 'unsafe-inline'; "
         "img-src 'self' data:; "
-        "connect-src 'self'; frame-ancestors 'none'; base-uri 'self'",
+        "connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; "
+        "object-src 'none'; form-action 'self'",
     )
+    if request.path.startswith("/static/"):
+        response.headers.setdefault("Cache-Control", "public, max-age=604800, immutable")
+    else:
+        response.headers.setdefault("Cache-Control", "no-store")
     return response
 
 
@@ -292,12 +315,48 @@ def _board_json(s: dict) -> dict:
         "in_check":    board.is_check(),
         "version":     s["version"],
         "bot_busy":    s["bot_busy"],
+        "increment":   s.get("increment", 0),
+        "decision_source": s.get("decision_source", "—"),
+        "opening_name": _opening_name(s["moves"]),
     }
+
+
+def _opening_name(moves: list[str]) -> str:
+    prefix = " ".join(moves[:6])
+    openings = (
+        ("e4 e5 Nf3 Nc6 Bb5", "Ruy López"),
+        ("e4 e5 Nf3 Nc6 Bc4", "Italian Game"),
+        ("e4 c5", "Sicilian Defense"),
+        ("e4 e6", "French Defense"),
+        ("e4 c6", "Caro–Kann Defense"),
+        ("e4 d5", "Scandinavian Defense"),
+        ("d4 d5 c4", "Queen's Gambit"),
+        ("d4 Nf6 c4 g6", "King's Indian Defense"),
+        ("d4 Nf6 c4 e6 Nc3 Bb4", "Nimzo-Indian Defense"),
+        ("Nf3", "Réti Opening"),
+        ("c4", "English Opening"),
+    )
+    for line, name in openings:
+        if prefix.startswith(line):
+            return name
+    return "Opening phase" if len(moves) < 16 else "Middlegame"
+
+
+def _save_snapshot(s: dict):
+    snapshots = s.setdefault("snapshots", [])
+    snapshots.append({
+        "fen": s["board"].fen(),
+        "moves": list(s["moves"]),
+        "bot_clock": s["bot_clock"],
+        "human_clock": s["human_clock"],
+        "last_move": s["last_move"],
+    })
+    del snapshots[:-200]
 
 
 def _tick_clock(s: dict):
     """Subtract wall time from whichever clock is running."""
-    now = time.time()
+    now = time.monotonic()
     elapsed = now - s["last_tick"]
     s["last_tick"] = now
     board: chess.Board = s["board"]
@@ -361,18 +420,25 @@ def _discard_analysis_sf():
 def api_games():
     """Fetch the 20 most recent chess.com games for the username."""
     hdrs = {"User-Agent": "ChessBot/1.0"}
+    with _games_cache_lock:
+        if _games_cache["data"] is not None and time.monotonic() < _games_cache["expires"]:
+            return jsonify({"games": _games_cache["data"], "cached": True})
     try:
-        archives = _requests.get(
+        archives_response = _requests.get(
             f"https://api.chess.com/pub/player/{USERNAME}/games/archives",
             headers=hdrs, timeout=10,
-        ).json().get("archives", [])
+        )
+        archives_response.raise_for_status()
+        archives = archives_response.json().get("archives", [])
         if not archives:
             return jsonify({"games": []})
 
         # Collect games from most-recent months until we have 20
         collected = []
-        for url in reversed(archives):
-            month = _requests.get(url, headers=hdrs, timeout=15).json().get("games", [])
+        for url in list(reversed(archives))[:6]:
+            response = _requests.get(url, headers=hdrs, timeout=15)
+            response.raise_for_status()
+            month = response.json().get("games", [])
             collected = month + collected
             if len(collected) >= 20:
                 break
@@ -408,7 +474,9 @@ def api_games():
                 "opening":    opening,
                 "user_color": "white" if is_white else "black",
             })
-        return jsonify({"games": result})
+        with _games_cache_lock:
+            _games_cache.update(data=result, expires=time.monotonic() + 300)
+        return jsonify({"games": result, "cached": False})
     except Exception:
         logger.exception("Unable to fetch recent games")
         return jsonify({"error": "Unable to fetch recent games."}), 502
@@ -443,7 +511,11 @@ def api_eval():
 @app.route("/api/lines", methods=["POST"])
 def api_lines():
     """Run Stockfish multipv=3 depth-15 on a FEN; return top-3 lines with SAN continuations."""
-    fen = _request_data().get("fen", "")
+    data = _request_data()
+    fen = data.get("fen", "")
+    multipv = min(5, max(1, data.get("lines", 3))) if isinstance(data.get("lines", 3), int) else 3
+    think_time = data.get("time", 0.3)
+    think_time = min(2.0, max(0.05, float(think_time))) if isinstance(think_time, (int, float)) else 0.3
     try:
         with _analysis_lock:
             sf = _get_analysis_sf()
@@ -452,7 +524,7 @@ def api_lines():
             board = chess.Board(fen)
             if board.is_game_over():
                 return jsonify({"lines": []})
-            infos = sf.analyse(board, chess.engine.Limit(time=0.3), multipv=3)
+            infos = sf.analyse(board, chess.engine.Limit(time=think_time), multipv=multipv)
             if not isinstance(infos, list):
                 infos = [infos]
 
@@ -478,7 +550,8 @@ def api_lines():
         # First line's score serves as the position eval for the eval bar
         ev = lines[0] if lines else {"cp": 0, "is_mate": False, "mate": None}
         return jsonify({"lines": lines,
-                        "eval_cp": ev["cp"], "eval_is_mate": ev["is_mate"], "eval_mate": ev["mate"]})
+                        "eval_cp": ev["cp"], "eval_is_mate": ev["is_mate"], "eval_mate": ev["mate"],
+                        "depth": max((info.get("depth", 0) for info in infos), default=0)})
     except Exception:
         logger.exception("Line analysis failed")
         with _analysis_lock:
@@ -486,1267 +559,10 @@ def api_lines():
         return jsonify({"error": "Line analysis failed."}), 500
 
 
-HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Alan Dai</title>
-<link rel="stylesheet" href="/static/vendor/chessboard-1.0.0.min.css">
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: #1a1a2e;
-    color: #e0e0e0;
-    font-family: 'Segoe UI', sans-serif;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    min-height: 100vh;
-    padding: 8px 16px 8px;
-  }
-  h1 { font-size: 1.2rem; letter-spacing: 1px; margin-bottom: 6px; color: #a78bfa; }
-
-  /* ── Navigation tabs ───────────────────────────────────────────────── */
-  #main-nav {
-    display: flex;
-    gap: 6px;
-    margin-bottom: 10px;
-    background: #262421;
-    padding: 4px;
-    border-radius: 8px;
-  }
-  .nav-tab {
-    padding: 7px 22px;
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: #8a8784;
-    font-size: 0.88rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-  }
-  .nav-tab:hover  { color: #e8e6e3; }
-  .nav-tab.active { background: #3d3a37; color: #e8e6e3; }
-
-  /* ── Analysis section ──────────────────────────────────────────────── */
-  #analyze-section { width: 100%; max-width: 480px; }
-
-  /* Games list */
-  #av-games-list { display: flex; flex-direction: column; gap: 4px; }
-  .game-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 9px 12px;
-    background: #262421;
-    border-radius: 6px;
-    cursor: pointer;
-    border-left: 3px solid transparent;
-    transition: background 0.12s;
-  }
-  .game-row:hover { background: #3d3a37; }
-  .result-badge {
-    width: 22px; height: 22px;
-    border-radius: 3px;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 0.78rem; font-weight: 700; flex-shrink: 0;
-  }
-  .result-W { background: #4d8c2f; color: #fff; }
-  .result-L { background: #922; color: #fff; }
-  .result-D { background: #555; color: #fff; }
-  .game-info { flex: 1; min-width: 0; }
-  .game-opp  { font-size: 0.88rem; font-weight: 600; color: #e8e6e3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .game-opening { font-size: 0.73rem; color: #8a8784; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .game-meta { font-size: 0.73rem; color: #666; text-align: right; flex-shrink: 0; }
-
-  /* Eval bar */
-  #av-eval-wrap {
-    width: 100%; height: 12px;
-    background: #1a1a1a;
-    border-radius: 3px;
-    overflow: hidden;
-    position: relative;
-    margin-bottom: 2px;
-  }
-  #av-eval-fill {
-    position: absolute; right: 0; top: 0; bottom: 0;
-    width: 50%;
-    background: #e8e6e3;
-    transition: width 0.25s ease;
-  }
-  #av-eval-label {
-    position: absolute; width: 100%; text-align: center;
-    line-height: 12px; font-size: 0.62rem; font-weight: 700;
-    color: rgba(128,128,128,0.9); pointer-events: none; z-index: 1;
-  }
-
-  /* Analysis move list */
-  #av-move-list {
-    width: 100%;
-    background: #262421;
-    border-radius: 6px;
-    padding: 5px 10px;
-    max-height: 68px;
-    overflow-y: auto;
-    font-size: 0.80rem;
-    color: #ccc;
-    margin-top: 4px;
-    line-height: 1.7;
-  }
-  .av-move {
-    display: inline-block;
-    padding: 1px 5px;
-    border-radius: 3px;
-    cursor: pointer;
-  }
-  .av-move:hover { background: #3d3a37; }
-  .av-move.current { background: #5b21b6; color: #fff; }
-
-  #setup-panel {
-    background: #16213e;
-    border: 1px solid #2d2d5e;
-    border-radius: 12px;
-    padding: 28px 32px;
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-    width: 320px;
-  }
-  #setup-panel h2 { font-size: 1rem; color: #a78bfa; margin-bottom: 4px; }
-  .row { display: flex; gap: 8px; }
-  .btn {
-    flex: 1;
-    padding: 10px;
-    border: 1px solid #3d3d6e;
-    border-radius: 8px;
-    background: #1a1a3e;
-    color: #e0e0e0;
-    cursor: pointer;
-    font-size: 0.9rem;
-    transition: background 0.15s, border-color 0.15s;
-  }
-  .btn:hover { background: #2a2a5e; }
-  .btn.selected { background: #5b21b6; border-color: #7c3aed; color: #fff; }
-  #start-btn {
-    padding: 12px;
-    background: #5b21b6;
-    border: none;
-    border-radius: 8px;
-    color: #fff;
-    font-size: 1rem;
-    cursor: pointer;
-    margin-top: 6px;
-    transition: background 0.15s;
-  }
-  #start-btn:hover { background: #7c3aed; }
-
-  #game-panel { display: none; flex-direction: column; align-items: center; gap: 0; width: 100%; max-width: 480px; }
-
-  /* ── Chess.com-style board square colours ──────────────────────────── */
-  .white-1e1d7 { background-color: #f0d9b5 !important; }
-  .black-3c85d { background-color: #b58863 !important; }
-
-  /* Coordinate labels: contrasting colour on each square type */
-  .white-1e1d7 .notation-322f9 { color: #b58863 !important; font-weight: 700; }
-  .black-3c85d .notation-322f9 { color: #f0d9b5 !important; font-weight: 700; }
-
-  /* ── Player info strip (avatar + name + clock) ─────────────────────── */
-  .player-strip {
-    width: 100%;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 6px 8px;
-    background: #262421;   /* chess.com's dark panel colour */
-    border-left: 3px solid transparent;
-  }
-  .player-strip.strip-top    { border-radius: 6px 6px 0 0; }
-  .player-strip.strip-bottom { border-radius: 0 0 6px 6px; }
-  .player-strip.active       { border-left-color: #81b64c; }
-
-  .player-avatar {
-    width: 36px; height: 36px;
-    background: #3d3a37;
-    border-radius: 4px;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 1.3rem;
-    flex-shrink: 0;
-  }
-  .player-meta { flex: 1; display: flex; flex-direction: column; gap: 1px; }
-  .player-name { font-size: 0.95rem; font-weight: 600; color: #e8e6e3; }
-  .player-sub  { font-size: 0.72rem; color: #8a8784; }
-
-  .player-clock {
-    font-size: 1.55rem;
-    font-variant-numeric: tabular-nums;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    padding: 5px 12px;
-    background: #161412;
-    border-radius: 5px;
-    color: #e8e6e3;
-    min-width: 78px;
-    text-align: center;
-    transition: background 0.2s, color 0.2s;
-  }
-  .player-strip.active .player-clock {
-    background: #e8e6e3;
-    color: #161412;
-  }
-  /* Low-time warning */
-  .player-strip.low-time .player-clock { background: #c62d2d; color: #fff; }
-
-  /* ── Board frame ───────────────────────────────────────────────────── */
-  #board-wrap {
-    width: 100%;
-    border-left: 3px solid #262421;
-    border-right: 3px solid #262421;
-  }
-
-  /* ── Status bar ────────────────────────────────────────────────────── */
-  #status {
-    width: 100%;
-    font-size: 0.85rem;
-    color: #8a8784;
-    min-height: 1.4em;
-    text-align: center;
-    padding: 6px 0 2px;
-  }
-
-  /* ── Move list ─────────────────────────────────────────────────────── */
-  #move-list {
-    width: 100%;
-    background: #262421;
-    border-radius: 6px;
-    padding: 8px 12px;
-    max-height: 110px;
-    overflow-y: auto;
-    font-size: 0.83rem;
-    color: #ccc;
-    line-height: 1.9;
-    margin-top: 8px;
-  }
-  .move-pair { display: inline; }
-  .move-num  { color: #666; margin-right: 2px; }
-  .move-san  {
-    display: inline-block;
-    padding: 1px 5px;
-    border-radius: 3px;
-    cursor: default;
-  }
-  .move-san:hover { background: #3d3a37; }
-
-  /* ── Action buttons ────────────────────────────────────────────────── */
-  .action-btn {
-    flex: 1;
-    padding: 9px;
-    border: 1px solid #3d3a37;
-    border-radius: 6px;
-    background: #262421;
-    color: #e0e0e0;
-    font-size: 0.88rem;
-    cursor: pointer;
-    transition: background 0.15s;
-  }
-  .action-btn:hover:not(:disabled) { background: #3d3a37; }
-  .action-btn:disabled { opacity: 0.30; cursor: default; }
-  .action-btn.danger   { color: #e57373; border-color: #7a2222; }
-  .action-btn.danger:hover:not(:disabled) { background: #2a1515; }
-  .action-btn.primary  { background: #4d8c2f; border-color: #5fa836; color: #fff; }
-  .action-btn.primary:hover:not(:disabled) { background: #5fa836; }
-  #action-row { display: flex; gap: 8px; width: 100%; margin-top: 10px; }
-
-  /* ── Square highlights ─────────────────────────────────────────────── */
-  #board .sq-last    { background-color: rgba(205, 195, 45, 0.62) !important; }
-  #board .sq-sel     { background-color: rgba(20, 130, 20, 0.52) !important;
-                       animation: sel-pulse 1.4s ease-in-out infinite; }
-  #board .sq-check   { background: radial-gradient(ellipse at center,
-                         rgba(255,0,0,0.88) 0%, rgba(231,0,0,0.38) 55%,
-                         transparent 100%) !important; }
-  #board .sq-premove { background-color: rgba(100, 100, 255, 0.40) !important; }
-
-  /* ── Legal-move indicators ─────────────────────────────────────────── */
-  .legal-dot {
-    position: absolute;
-    width: 30%; height: 30%;
-    background: rgba(0, 0, 0, 0.22);
-    border-radius: 50%;
-    top: 50%; left: 50%;
-    transform: translate(-50%, -50%);
-    pointer-events: none;
-    z-index: 10;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.25);
-  }
-  .legal-ring {
-    position: absolute;
-    width: 100%; height: 100%;
-    box-shadow: inset 0 0 0 5px rgba(0, 0, 0, 0.22);
-    top: 0; left: 0;
-    pointer-events: none;
-    z-index: 10;
-    border-radius: 2px;
-  }
-
-  /* ── Piece drag aesthetics ─────────────────────────────────────────── */
-  #board img, #av-board img {
-    cursor: grab;
-    user-select: none;
-    -webkit-user-select: none;
-  }
-  /* Dragged ghost piece (appended to <body> by chessboard.js during drag) */
-  body.is-dragging > img {
-    filter: drop-shadow(0 10px 24px rgba(0,0,0,0.70)) brightness(1.06) !important;
-    cursor: grabbing !important;
-    z-index: 9999 !important;
-  }
-  /* Pulse animation for selected square */
-  @keyframes sel-pulse {
-    0%, 100% { filter: brightness(1.0); }
-    50%       { filter: brightness(1.35); }
-  }
-
-  /* ── Analyze sub-nav ─────────────────────────────────────────────────── */
-  #analyze-sub-nav {
-    display: flex;
-    gap: 4px;
-    margin-bottom: 10px;
-    background: #262421;
-    padding: 3px;
-    border-radius: 7px;
-    width: 100%;
-  }
-
-  /* ── Engine lines panel ──────────────────────────────────────────────── */
-  #av-lines-panel { width: 100%; display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
-  .engine-line {
-    display: flex;
-    align-items: baseline;
-    gap: 7px;
-    background: #262421;
-    border-radius: 4px;
-    padding: 4px 8px;
-    font-size: 0.78rem;
-  }
-
-  /* ── Analysis: compact board + player strips ─────────────────────────── */
-  #av-board-wrap { max-width: 360px; }
-  #av-board .sq-sel  { background-color: rgba(20, 130, 20, 0.52) !important;
-                       animation: sel-pulse 1.4s ease-in-out infinite; }
-  #av-board .sq-last { background-color: rgba(205, 195, 45, 0.62) !important; }
-  #av-top-strip, #av-bottom-strip { padding: 3px 6px; }
-  #av-top-strip .player-avatar,
-  #av-bottom-strip .player-avatar  { width: 24px; height: 24px; font-size: 0.88rem; }
-  #av-top-strip .player-name,
-  #av-bottom-strip .player-name    { font-size: 0.82rem; }
-  #av-top-strip .player-sub,
-  #av-bottom-strip .player-sub     { font-size: 0.62rem; }
-  #analyze-sub-nav { margin-bottom: 6px; }
-  .ev-badge {
-    font-size: 0.72rem;
-    font-weight: 700;
-    padding: 2px 6px;
-    border-radius: 3px;
-    flex-shrink: 0;
-    min-width: 46px;
-    text-align: center;
-    font-family: monospace;
-  }
-  .ev-pos { background: #4d8c2f; color: #fff; }
-  .ev-neg { background: #922;    color: #fff; }
-  .ev-eq  { background: #555;    color: #fff; }
-  .ev-pv  { color: #b0aba6; line-height: 1.5; word-break: break-word; }
-</style>
-</head>
-<body>
-<h1>Alan Dai</h1>
-
-<nav id="main-nav">
-  <button class="nav-tab active" id="tab-play"    onclick="switchTab('play')">Play</button>
-</nav>
-
-<div id="play-section" style="width:100%;display:flex;flex-direction:column;align-items:center;">
-
-<!-- Setup -->
-<div id="setup-panel">
-  <div>
-    <h2>Time control</h2>
-    <div class="row">
-      <button class="btn tc-btn" data-tc="bullet">1 min</button>
-      <button class="btn tc-btn selected" data-tc="blitz">3 min</button>
-      <button class="btn tc-btn" data-tc="rapid">10 min</button>
-    </div>
-  </div>
-  <div>
-    <h2>You play as</h2>
-    <div class="row">
-      <button class="btn color-btn selected" data-color="white">White</button>
-      <button class="btn color-btn" data-color="black">Black</button>
-    </div>
-  </div>
-  <button id="start-btn">Start game</button>
-</div>
-
-<!-- Game -->
-<div id="game-panel">
-  <!-- Opponent (top) -->
-  <div class="player-strip strip-top" id="top-strip">
-    <div class="player-avatar" id="top-avatar">♟</div>
-    <div class="player-meta">
-      <div class="player-name" id="top-name">Alan Dai</div>
-      <div class="player-sub"  id="top-sub"></div>
-    </div>
-    <div class="player-clock" id="top-time">3:00</div>
-  </div>
-
-  <div id="board-wrap"><div id="board"></div></div>
-
-  <!-- Player (bottom) -->
-  <div class="player-strip strip-bottom" id="bottom-strip">
-    <div class="player-avatar" id="bottom-avatar">♙</div>
-    <div class="player-meta">
-      <div class="player-name" id="bottom-name">You</div>
-      <div class="player-sub"  id="bottom-sub"></div>
-    </div>
-    <div class="player-clock" id="bottom-time">3:00</div>
-  </div>
-
-  <div id="status"></div>
-  <div id="move-list"><span class="move-num" style="color:#555">No moves yet</span></div>
-  <div id="action-row">
-    <button id="abort-btn"    class="action-btn">Abort</button>
-    <button id="resign-btn"   class="action-btn danger">Resign</button>
-    <button id="rematch-btn"  class="action-btn primary" style="display:none">Rematch</button>
-    <button id="review-btn"   class="action-btn"         style="display:none">Review</button>
-    <button id="new-game-btn" class="action-btn"         style="display:none">New Game</button>
-  </div>
-</div><!-- #game-panel -->
-</div><!-- #play-section -->
-
-<!-- ── Review section ────────────────────────────────────────────── -->
-<div id="analyze-section" style="display:none">
-
-  <!-- Game viewer -->
-  <div id="av-game-view" style="display:flex;flex-direction:column;align-items:center;gap:0;">
-    <div style="width:100%;display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-      <button class="action-btn" style="flex:0;padding:6px 14px;" onclick="switchTab('play')">← Play</button>
-      <span id="av-game-title" style="font-size:0.82rem;color:#8a8784;text-align:right;flex:1;padding-left:10px;"></span>
-    </div>
-    <div id="av-eval-wrap">
-      <div id="av-eval-fill"></div>
-      <div id="av-eval-label">–</div>
-    </div>
-    <div class="player-strip strip-top" id="av-top-strip">
-      <div class="player-avatar" id="av-top-avatar">♟</div>
-      <div class="player-meta">
-        <div class="player-name" id="av-top-name">Opponent</div>
-        <div class="player-sub"  id="av-top-sub">Black</div>
-      </div>
-    </div>
-    <div id="av-board-wrap" style="width:100%;border-left:3px solid #262421;border-right:3px solid #262421;">
-      <div id="av-board"></div>
-    </div>
-    <div class="player-strip strip-bottom" id="av-bottom-strip">
-      <div class="player-avatar" id="av-bottom-avatar">♙</div>
-      <div class="player-meta">
-        <div class="player-name" id="av-bottom-name">You (yuandan)</div>
-        <div class="player-sub"  id="av-bottom-sub">White</div>
-      </div>
-    </div>
-    <div style="display:flex;gap:6px;margin-top:10px;width:100%;">
-      <button class="action-btn" onclick="avGoTo(0)">|◀</button>
-      <button class="action-btn" onclick="avStepBack()">◀</button>
-      <button class="action-btn" onclick="avStep(1)">▶</button>
-      <button class="action-btn" onclick="avGoTo(avMoves.length)">▶|</button>
-    </div>
-    <button id="av-var-back" class="action-btn"
-            style="display:none;margin-top:4px;width:100%;color:#f0a830;border-color:#5a4015;"
-            onclick="avClearVariation()">← Back to main line</button>
-    <div id="av-move-list"></div>
-    <div id="av-lines-panel"></div>
-  </div>
-</div><!-- #analyze-section -->
-
-<script src="/static/vendor/jquery-3.7.1.min.js"></script>
-<script src="/static/vendor/chessboard-1.0.0.min.js"></script>
-<script src="/static/vendor/chess-0.10.3.min.js"></script>
-<script>
-let board, game;
-let botColor, humanColor;
-let pollInterval, clockInterval;
-let gameOver    = false;
-let premove     = null;   // {from, to} queued during bot's turn
-let selSquare   = null;   // currently click-selected square ("e2" etc.)
-let _justDropped = false;  // suppress click event that fires right after a drag-drop
-let _pendingSelect = null; // square to re-select after snapback re-renders the board
-let _lastData    = null;  // most recent server state — re-applied after board re-renders
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-// chess.py integer square (0=a1 … 63=h8) → algebraic string
-function sqToAlg(n) { return 'abcdefgh'[n % 8] + (Math.floor(n / 8) + 1); }
-
-// Walk up from a clicked DOM element to find the enclosing ".square-XY" name
-function squareFromEl(el) {
-  for (let i = 0; i < 5 && el && el.id !== 'board'; i++, el = el.parentElement) {
-    const m = (el.className || '').match(/square-([a-h][1-8])/);
-    if (m) return m[1];
-  }
-  return null;
-}
-
-// Is pieceCode ('wP', 'bN' …) one of the human player's pieces?
-function isOwnPiece(pieceCode) {
-  if (!pieceCode) return false;
-  return humanColor === 'white' ? pieceCode[0] === 'w' : pieceCode[0] === 'b';
-}
-
-// ── Legal-move indicators ──────────────────────────────────────────────────
-
-function showLegalDots(square) {
-  let moves;
-  if (game.turn() === humanColor[0]) {
-    moves = game.moves({ square, verbose: true });
-  } else {
-    // Bot's turn: swap active colour in a temp game so we can see premove options.
-    try {
-      const parts = game.fen().split(' ');
-      parts[1] = humanColor[0];
-      parts[3] = '-';  // clear en-passant to avoid FEN validation errors
-      const tmp = new Chess(parts.join(' '));
-      moves = tmp ? tmp.moves({ square, verbose: true }) : [];
-    } catch(e) { moves = []; }
-  }
-  moves.forEach(mv => {
-    const $sq = $(`#board .square-${mv.to}`);
-    const occupied = !!game.get(mv.to);
-    $sq.append(occupied ? '<div class="legal-ring"></div>'
-                        : '<div class="legal-dot"></div>');
-  });
-}
-
-function clearLegalDots() { $('#board .legal-dot, #board .legal-ring').remove(); }
-
-// ── Square-colour highlights ───────────────────────────────────────────────
-
-function highlightLastMove(lm) {
-  $('#board .sq-last').removeClass('sq-last');
-  if (!lm) return;
-  $(`#board .square-${sqToAlg(lm[0])}`).addClass('sq-last');
-  $(`#board .square-${sqToAlg(lm[1])}`).addClass('sq-last');
-}
-
-function highlightCheck(inCheck) {
-  $('#board .sq-check').removeClass('sq-check');
-  if (!inCheck) return;
-  const color = game.turn();
-  game.board().forEach((row, r) => row.forEach((p, f) => {
-    if (p && p.type === 'k' && p.color === color)
-      $(`#board .square-${'abcdefgh'[f]}${8 - r}`).addClass('sq-check');
-  }));
-}
-
-function applyHighlights(data) {
-  if (data) _lastData = data; else data = _lastData;
-  if (!data) return;
-  highlightLastMove(data.last_move);
-  highlightCheck(data.in_check);
-}
-
-// ── Click-to-move selection ────────────────────────────────────────────────
-
-function selectSquare(sq) {
-  clearSelection();
-  selSquare = sq;
-  $(`#board .square-${sq}`).addClass('sq-sel');
-  showLegalDots(sq);
-}
-
-function clearSelection() {
-  clearLegalDots();
-  $('#board .sq-sel').removeClass('sq-sel');
-  selSquare = null;
-}
-
-// ── Premove ────────────────────────────────────────────────────────────────
-
-function setPremove(from, to) {
-  clearPremove();
-  premove = { from, to };
-  $(`#board .square-${from}`).addClass('sq-premove');
-  $(`#board .square-${to}`).addClass('sq-premove');
-}
-
-function clearPremove() {
-  premove = null;
-  $('#board .sq-premove').removeClass('sq-premove');
-}
-
-// ── Drag callbacks ─────────────────────────────────────────────────────────
-
-function onDragStart(source, piece) {
-  if (gameOver) return false;
-  if (humanColor === 'white' && piece[0] === 'b') return false;
-  if (humanColor === 'black' && piece[0] === 'w') return false;
-  document.body.classList.add('is-dragging');
-  clearSelection();
-  if (game.turn() === humanColor[0]) {
-    showLegalDots(source);
-    $(`#board .square-${source}`).addClass('sq-sel');
-  }
-}
-
-function onDrop(source, target) {
-  document.body.classList.remove('is-dragging');
-
-  // Prevent the click event that fires right after mouseup
-  _justDropped = true;
-  setTimeout(() => { _justDropped = false; }, 80);
-
-  if (gameOver) { clearLegalDots(); $('#board .sq-sel').removeClass('sq-sel'); return 'snapback'; }
-
-  if (source === target) {
-    // Click-release: dots and sq-sel are already showing from onDragStart — keep them.
-    // Just lock in the logical selection so destination clicks work immediately.
-    const pieceObj = game.get(source);
-    if (pieceObj && isOwnPiece(pieceObj.color + pieceObj.type.toUpperCase())) {
-      selSquare = source;
-      _pendingSelect = source; // re-apply after onSnapEnd in case board re-renders
-    } else {
-      clearLegalDots();
-      $('#board .sq-sel').removeClass('sq-sel');
-    }
-    return 'snapback';
-  }
-
-  clearLegalDots();
-  $('#board .sq-sel').removeClass('sq-sel');
-
-  if (game.turn() !== humanColor[0]) {
-    // Bot's turn → queue premove
-    setPremove(source, target);
-    document.getElementById('status').textContent = 'Premove queued — waiting for bot…';
-    return;
-  }
-
-  clearPremove();
-  const move = game.move({ from: source, to: target, promotion: 'q' });
-  if (move === null) return 'snapback';
-
-  document.getElementById('status').textContent = 'Alan Dai is thinking…';
-  submitMove(move.from + move.to + (move.promotion || ''));
-}
-
-function onSnapEnd() {
-  document.body.classList.remove('is-dragging');
-  if (_pendingSelect) {
-    // Click-release on same square: position unchanged, just restore visual selection
-    clearLegalDots();
-    const sq = _pendingSelect;
-    _pendingSelect = null;
-    selectSquare(sq);
-  } else {
-    clearLegalDots();
-    if (!premove) { board.position(game.fen()); applyHighlights(null); }
-  }
-}
-
-// ── Click-to-move ──────────────────────────────────────────────────────────
-// Use capture phase so the handler fires before chessboard.js can stop propagation.
-// Wired up once after the board div exists; survives board.destroy()/reinit.
-
-function _boardClickHandler(e) {
-  if (_justDropped || gameOver) return;
-
-  const sq = squareFromEl(e.target);
-  if (!sq) { clearSelection(); return; }
-
-  const pieceObj  = game.get(sq);
-  const pieceCode = pieceObj ? (pieceObj.color + pieceObj.type.toUpperCase()) : null;
-  const own       = isOwnPiece(pieceCode);
-
-  if (selSquare) {
-    if (selSquare === sq) { clearSelection(); return; }
-
-    if (game.turn() !== humanColor[0]) {
-      if (own) { clearSelection(); selectSquare(sq); }
-      else {
-        setPremove(selSquare, sq);
-        clearSelection();
-        document.getElementById('status').textContent = 'Premove queued — waiting for bot…';
-      }
-      return;
-    }
-
-    const mv = game.move({ from: selSquare, to: sq, promotion: 'q' });
-    if (mv) {
-      clearSelection();
-      board.position(game.fen()); applyHighlights(null);
-      document.getElementById('status').textContent = 'Alan Dai is thinking…';
-      submitMove(mv.from + mv.to + (mv.promotion || ''));
-    } else if (own) {
-      clearSelection(); selectSquare(sq);
-    } else {
-      clearSelection();
-    }
-  } else {
-    if (own) selectSquare(sq);
-  }
-}
-
-document.getElementById('board').addEventListener('click', _boardClickHandler, true);
-
-// ── Server communication ───────────────────────────────────────────────────
-
-let serverVersion = 0;
-
-function submitMove(uci) {
-  fetch('/move', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ uci, expected_version: serverVersion })
-  }).then(r => r.json()).then(handleStateUpdate);
-}
-
-function triggerBotMove() {
-  document.getElementById('status').textContent = 'Alan Dai is thinking…';
-  fetch('/bot_move', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ expected_version: serverVersion })
-  }).then(r => r.json()).then(handleStateUpdate);
-}
-
-function handleStateUpdate(data) {
-  if (Number.isInteger(data.version)) serverVersion = data.version;
-  if (data.error) {
-    document.getElementById('status').textContent = data.error;
-    if (data.error === 'No game in progress.') {
-      gameOver = true;
-      clearInterval(pollInterval); clearInterval(clockInterval);
-      setGameButtons(true);
-    }
-    return;
-  }
-  game.load(data.fen);
-  board.position(data.fen, true);
-  updateClocks(data);
-  updateMoveList(data.moves);
-  applyHighlights(data);
-
-  if (data.over) {
-    gameOver = true;
-    clearPremove(); clearSelection();
-    clearInterval(pollInterval); clearInterval(clockInterval);
-    document.getElementById('status').textContent = data.result;
-    setGameButtons(true);
-    return;
-  }
-  if (data.turn === botColor) {
-    triggerBotMove();
-  } else if (premove) {
-    const pm = premove;
-    clearPremove();
-    const mv = game.move({ from: pm.from, to: pm.to, promotion: 'q' });
-    if (mv === null) {
-      board.position(game.fen()); applyHighlights(null);
-      document.getElementById('status').textContent = 'Your turn';
-    } else {
-      board.position(game.fen(), true);
-      document.getElementById('status').textContent = 'Alan Dai is thinking…';
-      submitMove(pm.from + pm.to + (mv.promotion || ''));
-    }
-  } else {
-    document.getElementById('status').textContent = 'Your turn';
-  }
-}
-
-// ── Setup panel ────────────────────────────────────────────────────────────
-
-document.querySelectorAll('.tc-btn').forEach(b => {
-  b.addEventListener('click', () => {
-    document.querySelectorAll('.tc-btn').forEach(x => x.classList.remove('selected'));
-    b.classList.add('selected');
-  });
-});
-document.querySelectorAll('.color-btn').forEach(b => {
-  b.addEventListener('click', () => {
-    document.querySelectorAll('.color-btn').forEach(x => x.classList.remove('selected'));
-    b.classList.add('selected');
-  });
-});
-
-let _lastTc, _lastBotColor;  // remembered for rematch
-
-document.getElementById('start-btn').addEventListener('click', startGame);
-
-document.getElementById('abort-btn').addEventListener('click', () => {
-  fetch('/abort', { method: 'POST' }).then(r => r.json()).then(data => {
-    if (data.error) { document.getElementById('status').textContent = data.error; return; }
-    handleStateUpdate(data);
-  });
-});
-
-document.getElementById('resign-btn').addEventListener('click', () => {
-  if (!confirm('Resign this game?')) return;
-  fetch('/resign', { method: 'POST' }).then(r => r.json()).then(handleStateUpdate);
-});
-
-document.getElementById('rematch-btn').addEventListener('click', () => {
-  startGameWith(_lastTc, _lastBotColor, true);
-});
-
-document.getElementById('review-btn').addEventListener('click', () => {
-  closeGameViewer();
-  const pgn = game ? game.pgn() : '';
-  if (!pgn) return;
-  switchTab('analyze');
-  openGameViewer({ pgn, user_color: humanColor, opponent: 'Alan Dai', opp_rating: '', result: '', time_class: _lastTc || 'blitz' });
-});
-
-document.getElementById('new-game-btn').addEventListener('click', () => {
-  clearInterval(pollInterval);
-  clearInterval(clockInterval);
-  document.getElementById('game-panel').style.display = 'none';
-  document.getElementById('setup-panel').style.display = 'flex';
-});
-
-function startGame() {
-  const tc    = document.querySelector('.tc-btn.selected').dataset.tc;
-  const color = document.querySelector('.color-btn.selected').dataset.color;
-  startGameWith(tc, color === 'white' ? 'black' : 'white', false);
-}
-
-function startGameWith(tc, botSide, isRematch) {
-  humanColor = botSide === 'white' ? 'black' : 'white';
-  botColor   = botSide;
-  _lastTc       = tc;
-  _lastBotColor = botSide;
-
-  fetch('/new_game', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ tc, bot_color: botSide, is_rematch: isRematch })
-  }).then(r => r.json()).then(data => {
-    document.getElementById('setup-panel').style.display = 'none';
-    document.getElementById('game-panel').style.display  = 'flex';
-    initBoard(data);
-    if (data.turn === botColor) triggerBotMove();
-    startClockTick();
-    pollInterval = setInterval(syncState, 1000);
-  });
-}
-
-function initBoard(data) {
-  serverVersion = data.version || 0;
-  game = new Chess();
-  gameOver = false;
-  clearPremove();
-  clearSelection();
-
-  document.getElementById('top-name').textContent    = 'Alan Dai';
-  document.getElementById('top-sub').textContent     = botColor === 'black' ? 'Black' : 'White';
-  document.getElementById('top-avatar').textContent  = botColor === 'black' ? '♟' : '♙';
-  document.getElementById('bottom-name').textContent = 'You';
-  document.getElementById('bottom-sub').textContent  = humanColor === 'white' ? 'White' : 'Black';
-  document.getElementById('bottom-avatar').textContent = humanColor === 'white' ? '♙' : '♟';
-
-  if (board) board.destroy();
-  board = Chessboard('board', {
-    position:        data.fen,
-    orientation:     humanColor,
-    draggable:       true,
-    showNotation:    true,
-    moveSpeed:       180,
-    snapSpeed:       70,
-    snapbackSpeed:   80,
-    onDragStart,
-    onDrop,
-    onSnapEnd,
-    onMoveEnd:       () => applyHighlights(null),
-    pieceTheme:      '/static/pieces/{piece}.png',
-  });
-
-  updateClocks(data);
-  updateMoveList(data.moves);
-  applyHighlights(data);
-  setGameButtons(false);
-  document.getElementById('status').textContent = data.turn === humanColor ? 'Your turn' : 'Alan Dai is thinking…';
-}
-
-function setGameButtons(over) {
-  document.getElementById('abort-btn').style.display    = over ? 'none' : '';
-  document.getElementById('resign-btn').style.display   = over ? 'none' : '';
-  document.getElementById('rematch-btn').style.display  = over ? '' : 'none';
-  document.getElementById('review-btn').style.display   = over ? '' : 'none';
-  document.getElementById('new-game-btn').style.display = over ? '' : 'none';
-  if (!over && game) {
-    document.getElementById('abort-btn').disabled = game.history().length > 4;
-  }
-}
-
-// ── Poll / clock ───────────────────────────────────────────────────────────
-
-function syncState() {
-  if (gameOver) return;
-  fetch('/state').then(r => r.json()).then(data => {
-    if (Number.isInteger(data.version)) serverVersion = data.version;
-    updateClocks(data);
-    if (data.over && !gameOver) {
-      gameOver = true;
-      document.getElementById('status').textContent = data.result;
-      setGameButtons(true);
-      clearInterval(pollInterval); clearInterval(clockInterval);
-    }
-  });
-}
-
-let _botClock, _humanClock, _lastTick, _activeSide;
-function startClockTick() {
-  clearInterval(clockInterval);
-  clockInterval = setInterval(() => {
-    if (gameOver) return;
-    const now = Date.now() / 1000;
-    const elapsed = now - _lastTick;
-    _lastTick = now;
-    if (_activeSide === botColor)        _botClock   = Math.max(0, _botClock   - elapsed);
-    else if (_activeSide === humanColor) _humanClock = Math.max(0, _humanClock - elapsed);
-    renderClocks();
-  }, 100);
-}
-
-function updateClocks(data) {
-  _botClock   = data.bot_clock;
-  _humanClock = data.human_clock;
-  _activeSide = data.turn;
-  _lastTick   = Date.now() / 1000;
-  renderClocks();
-}
-
-function renderClocks() {
-  document.getElementById('top-time').textContent    = formatTime(_botClock);
-  document.getElementById('bottom-time').textContent = formatTime(_humanClock);
-
-  const topActive    = _activeSide === botColor;
-  const bottomActive = _activeSide === humanColor;
-  document.getElementById('top-strip').classList.toggle('active',    topActive);
-  document.getElementById('bottom-strip').classList.toggle('active', bottomActive);
-
-  // Low-time warning: < 30 s on active player's clock
-  document.getElementById('top-strip').classList.toggle('low-time',    topActive    && _botClock   < 30);
-  document.getElementById('bottom-strip').classList.toggle('low-time', bottomActive && _humanClock < 30);
-}
-
-function formatTime(s) {
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  return `${m}:${sec.toString().padStart(2, '0')}`;
-}
-
-function updateMoveList(moves) {
-  const el = document.getElementById('move-list');
-  if (!moves.length) {
-    el.innerHTML = '<span class="move-num" style="color:#555">No moves yet</span>';
-    return;
-  }
-  let html = '';
-  for (let i = 0; i < moves.length; i += 2) {
-    const num = Math.floor(i / 2) + 1;
-    const w = moves[i]   ? `<span class="move-san">${moves[i]}</span>`   : '';
-    const b = moves[i+1] ? `<span class="move-san">${moves[i+1]}</span>` : '';
-    html += `<span class="move-num">${num}.</span>${w} ${b} `;
-  }
-  el.innerHTML = html;
-  el.scrollTop = el.scrollHeight;
-}
-
-// ── Tab switching ──────────────────────────────────────────────────────────
-
-function switchTab(tab) {
-  document.getElementById('play-section').style.display    = tab === 'play'    ? 'flex' : 'none';
-  document.getElementById('analyze-section').style.display = tab === 'analyze' ? 'flex' : 'none';
-  document.getElementById('tab-play').classList.toggle('active', tab === 'play');
-}
-
-// ── Analysis: game viewer ──────────────────────────────────────────────────
-
-let avBoard        = null;
-let avViewer       = new Chess();  // chess.js game used for position replay
-let avMoves        = [];           // main-line moves from the PGN
-let avIdx          = 0;            // current position in the main line (0 = start)
-let avVariation    = [];           // moves made by the user beyond avIdx (exploration)
-let avSelSquare    = null;         // click-selected square in analysis board
-let avEvalDebounce = null;
-
-function openGameViewer(g) {
-
-  // Parse PGN
-  const loader = new Chess();
-  if (!loader.load_pgn(g.pgn)) { alert('Could not parse PGN.'); return; }
-  avMoves = loader.history({ verbose: true });
-
-  // Reset replay game to start
-  avViewer = new Chess();
-  avIdx    = 0;
-
-  // Player labels
-  const botTop = g.user_color === 'black';
-  document.getElementById('av-top-name').textContent    = botTop ? 'You (yuandan)' : g.opponent;
-  document.getElementById('av-top-sub').textContent     = botTop ? 'Black' : 'White';
-  document.getElementById('av-top-avatar').textContent  = botTop ? '♟' : '♙';
-  document.getElementById('av-bottom-name').textContent = botTop ? g.opponent : 'You (yuandan)';
-  document.getElementById('av-bottom-sub').textContent  = botTop ? 'White' : 'Black';
-  document.getElementById('av-bottom-avatar').textContent = botTop ? '♙' : '♟';
-
-  document.getElementById('av-game-title').textContent =
-    `${g.result === 'W' ? '✓' : g.result === 'L' ? '✗' : '½'} vs ${g.opponent} · ${g.opening}`;
-
-  const orient = g.user_color;
-  if (avBoard) avBoard.destroy();
-  avBoard = Chessboard('av-board', {
-    position:        'start',
-    orientation:     orient,
-    draggable:       true,
-    showNotation:    true,
-    moveSpeed:       180,
-    snapSpeed:       70,
-    snapbackSpeed:   80,
-    onDragStart:     () => { document.body.classList.add('is-dragging'); return true; },
-    onDrop:          avOnDrop,
-    onSnapEnd:       avOnSnapEnd,
-    pieceTheme:      '/static/pieces/{piece}.png',
-  });
-
-  renderAvMoveList();
-  fetchLines(avViewer.fen());
-}
-
-function closeGameViewer() {
-  document.getElementById('av-lines-panel').innerHTML = '';
-  avVariation = []; avSelSquare = null;
-  if (avBoard) { avBoard.destroy(); avBoard = null; }
-}
-
-function avGoTo(idx) {
-  idx = Math.max(0, Math.min(avMoves.length, idx));
-  avVariation = [];
-  avClearAvSel();
-  document.getElementById('av-var-back').style.display = 'none';
-  avViewer = new Chess();
-  for (let i = 0; i < idx; i++) avViewer.move(avMoves[i]);
-  avIdx = idx;
-  avBoard.position(avViewer.fen(), false);
-  renderAvMoveList();
-  scheduleLines(avViewer.fen());
-}
-
-function avStep(delta) { avGoTo(avIdx + delta); }
-
-function avStepBack() {
-  if (avVariation.length > 0) {
-    avVariation.pop();
-    avViewer.undo();
-    avClearAvSel();
-    avBoard.position(avViewer.fen(), false);
-    scheduleLines(avViewer.fen());
-    if (avVariation.length === 0)
-      document.getElementById('av-var-back').style.display = 'none';
-  } else {
-    avGoTo(avIdx - 1);
-  }
-}
-
-function avClearVariation() {
-  avVariation = [];
-  avClearAvSel();
-  document.getElementById('av-var-back').style.display = 'none';
-  avViewer = new Chess();
-  for (let i = 0; i < avIdx; i++) avViewer.move(avMoves[i]);
-  avBoard.position(avViewer.fen(), false);
-  scheduleLines(avViewer.fen());
-}
-
-// ── Analysis drag-and-drop ─────────────────────────────────────────────────
-
-function avOnDrop(source, target) {
-  document.body.classList.remove('is-dragging');
-  if (source === target) return 'snapback';
-  avClearAvSel();
-  const move = avViewer.move({ from: source, to: target, promotion: 'q' });
-  if (move === null) return 'snapback';
-  avVariation.push(move);
-  scheduleLines(avViewer.fen());
-  document.getElementById('av-var-back').style.display = '';
-}
-
-function avOnSnapEnd() {
-  document.body.classList.remove('is-dragging');
-  avBoard.position(avViewer.fen());
-}
-
-// ── Analysis click-to-move ─────────────────────────────────────────────────
-
-function avSelectSq(sq) {
-  avClearAvSel();
-  avSelSquare = sq;
-  $(`#av-board .square-${sq}`).addClass('sq-sel');
-  avViewer.moves({ square: sq, verbose: true }).forEach(mv => {
-    const occupied = !!avViewer.get(mv.to);
-    $(`#av-board .square-${mv.to}`).append(
-      occupied ? '<div class="legal-ring"></div>' : '<div class="legal-dot"></div>'
-    );
-  });
-}
-
-function avClearAvSel() {
-  $('#av-board .sq-sel').removeClass('sq-sel');
-  $('#av-board .legal-dot, #av-board .legal-ring').remove();
-  avSelSquare = null;
-}
-
-$(document).on('click', '#av-board', function(e) {
-  if (!avBoard) return;
-  const sq = squareFromEl(e.target);
-  if (!sq) { avClearAvSel(); return; }
-
-  if (avSelSquare) {
-    if (avSelSquare === sq) { avClearAvSel(); return; }
-    const move = avViewer.move({ from: avSelSquare, to: sq, promotion: 'q' });
-    avClearAvSel();
-    if (move) {
-      avVariation.push(move);
-      avBoard.position(avViewer.fen(), false);
-      scheduleLines(avViewer.fen());
-      document.getElementById('av-var-back').style.display = '';
-    } else if (avViewer.get(sq)) {
-      avSelectSq(sq);
-    }
-  } else {
-    if (avViewer.get(sq)) avSelectSq(sq);
-  }
-});
-
-// Keyboard navigation
-document.addEventListener('keydown', e => {
-  const viewing = document.getElementById('av-game-view').style.display !== 'none'
-                  && document.getElementById('analyze-section').style.display !== 'none';
-  if (!viewing) return;
-  if (e.key === 'ArrowLeft')  avStepBack();
-  if (e.key === 'ArrowRight') avStep(1);
-  if (e.key === 'ArrowUp')    avGoTo(0);
-  if (e.key === 'ArrowDown')  avGoTo(avMoves.length);
-});
-
-function renderAvMoveList() {
-  let html = '';
-  for (let i = 0; i < avMoves.length; i += 2) {
-    const num = Math.floor(i / 2) + 1;
-    const wCls = (avIdx === i + 1) ? 'av-move current' : 'av-move';
-    const bCls = (avIdx === i + 2) ? 'av-move current' : 'av-move';
-    const w = `<span class="${wCls}" onclick="avGoTo(${i+1})">${avMoves[i].san}</span>`;
-    const b = avMoves[i+1]
-      ? `<span class="${bCls}" onclick="avGoTo(${i+2})">${avMoves[i+1].san}</span>`
-      : '';
-    html += `<span class="move-num">${num}.</span>${w} ${b} `;
-  }
-  const el = document.getElementById('av-move-list');
-  el.innerHTML = html || '<span style="color:#555">Start of game</span>';
-  // Scroll current move into view
-  const cur = el.querySelector('.current');
-  if (cur) cur.scrollIntoView({ block: 'nearest' });
-}
-
-// ── Eval bar ───────────────────────────────────────────────────────────────
-
-function scheduleEval(fen) {
-  clearTimeout(avEvalDebounce);
-  document.getElementById('av-eval-label').textContent = '…';
-  avEvalDebounce = setTimeout(() => fetchEval(fen), 150);
-}
-
-function fetchEval(fen) {
-  fetch('/api/eval', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ fen })
-  }).then(r => r.json()).then(data => {
-    if (data.error) return;
-    updateEvalBar(data.cp, data.is_mate, data.mate);
-  }).catch(() => {});
-}
-
-function updateEvalBar(cp, isMate, mate) {
-  // Sigmoid: white% = 50 + 50*tanh(cp/300)
-  const pct  = isMate
-    ? (cp > 0 ? 100 : 0)
-    : Math.max(2, Math.min(98, 50 + 50 * Math.tanh(cp / 300)));
-  document.getElementById('av-eval-fill').style.width = pct + '%';
-
-  let label;
-  if (isMate) {
-    label = mate > 0 ? `M${mate}` : `M${-mate}`;
-  } else {
-    const sign = cp >= 0 ? '+' : '';
-    label = `${sign}${(cp / 100).toFixed(1)}`;
-  }
-  document.getElementById('av-eval-label').textContent = label;
-}
-
-// ── Engine lines ───────────────────────────────────────────────────────────
-
-let avLinesDebounce = null;
-
-function scheduleLines(fen) {
-  clearTimeout(avLinesDebounce);
-  avLinesDebounce = setTimeout(() => fetchLines(fen), 60);
-}
-
-function fetchLines(fen) {
-  fetch('/api/lines', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ fen })
-  }).then(r => r.json()).then(data => {
-    if (data.error || !data.lines) {
-      document.getElementById('av-lines-panel').innerHTML = '';
-      return;
-    }
-    // Update eval bar from the best line — avoids a separate /api/eval round-trip
-    updateEvalBar(data.eval_cp, data.eval_is_mate, data.eval_mate);
-    updateEngineLines(data.lines);
-  }).catch(() => { document.getElementById('av-lines-panel').innerHTML = ''; });
-}
-
-function updateEngineLines(lines) {
-  const panel = document.getElementById('av-lines-panel');
-  if (!lines || !lines.length) { panel.innerHTML = ''; return; }
-  panel.innerHTML = lines.map(line => {
-    const cp = line.cp, isMate = line.is_mate;
-    let label, cls;
-    if (isMate) {
-      label = line.mate > 0 ? `M${line.mate}` : `M${-line.mate}`;
-      cls   = line.mate > 0 ? 'ev-pos' : 'ev-neg';
-    } else {
-      const sign = cp >= 0 ? '+' : '';
-      label = `${sign}${(cp / 100).toFixed(2)}`;
-      cls   = cp > 15 ? 'ev-pos' : (cp < -15 ? 'ev-neg' : 'ev-eq');
-    }
-    const pvText = line.pv.join(' ');
-    return `<div class="engine-line">
-      <span class="ev-badge ${cls}">${label}</span>
-      <span class="ev-pv">${pvText}</span>
-    </div>`;
-  }).join('');
-}
-</script>
-</body>
-</html>
-"""
-
 
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    return render_template("index.html")
 
 
 @app.route("/new_game", methods=["POST"])
@@ -1758,6 +574,13 @@ def new_game():
     tc         = data.get("tc", "blitz")
     bot_color  = data.get("bot_color", "black")
     is_rematch = bool(data.get("is_rematch", False))
+    initial_seconds = data.get("initial_seconds")
+    increment_seconds = data.get("increment_seconds", 0)
+    if initial_seconds is not None:
+        if not isinstance(initial_seconds, (int, float)) or not 60 <= initial_seconds <= 10800:
+            return jsonify({"error": "Custom clock must be between 1 and 180 minutes."}), 400
+        if not isinstance(increment_seconds, (int, float)) or not 0 <= increment_seconds <= 60:
+            return jsonify({"error": "Increment must be between 0 and 60 seconds."}), 400
     if tc not in TIME_CONTROLS:
         return jsonify({"error": "Unsupported time control."}), 400
     if bot_color not in ("white", "black"):
@@ -1776,7 +599,11 @@ def new_game():
             _reserved_games += 1
     token = secrets.token_urlsafe(32)
     try:
-        s = _new_state(tc, bot_color)
+        s = (
+            _new_state(tc, bot_color, initial_seconds, increment_seconds)
+            if initial_seconds is not None
+            else _new_state(tc, bot_color)
+        )
     except Exception:
         logger.exception("Unable to initialize a new game")
         with _games_lock:
@@ -1869,8 +696,10 @@ def human_move():
         _check_game_over(s)
         if s["over"]:
             return jsonify(_board_json(s)), 409
+        _save_snapshot(s)
         san = board.san(move)
         board.push(move)
+        s["human_clock"] += s.get("increment", 0)
         s["moves"].append(san)
         s["last_move"] = [move.from_square, move.to_square]
         s["version"] += 1
@@ -1937,11 +766,39 @@ def bot_move():
         if s["over"]:
             return jsonify(_board_json(s))
         san = s["board"].san(move)
+        _save_snapshot(s)
         s["board"].push(move)
+        s["bot_clock"] += s.get("increment", 0)
         s["moves"].append(san)
         s["last_move"] = [move.from_square, move.to_square]
         s["version"] += 1
+        s["decision_source"] = getattr(engine, "last_decision_source", "chess engine")
         _check_game_over(s)
+        return jsonify(_board_json(s))
+
+
+@app.route("/undo", methods=["POST"])
+def undo_move():
+    _, s, error = _game_or_error()
+    if error:
+        return error
+    with s["lock"]:
+        if s.get("bot_busy"):
+            return jsonify({"error": "Wait for the bot move to finish."}), 409
+        if len(s["snapshots"]) < 2:
+            return jsonify({"error": "There is no complete turn to undo."}), 409
+        snapshot = s["snapshots"][-2]
+        s["snapshots"] = s["snapshots"][:-2]
+        s["board"] = chess.Board(snapshot["fen"])
+        s["moves"] = snapshot["moves"]
+        s["bot_clock"] = snapshot["bot_clock"]
+        s["human_clock"] = snapshot["human_clock"]
+        s["last_move"] = snapshot["last_move"]
+        s["over"] = False
+        s["result"] = None
+        s["decision_source"] = "undo"
+        s["last_tick"] = time.monotonic()
+        s["version"] += 1
         return jsonify(_board_json(s))
 
 
@@ -1959,11 +816,7 @@ def get_state():
 @app.route("/debug")
 def debug():
     """Non-sensitive compatibility endpoint; prefer /health/live and /health/ready."""
-    info = {
-        "username": USERNAME,
-        "model_ready": MODEL_ERROR is None,
-        "active_games": len(_games),
-    }
+    info = {"model_ready": MODEL_ERROR is None}
     return jsonify(info)
 
 

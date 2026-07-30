@@ -11,3 +11,9 @@ ChessBot_v1_drew_3200/
 local_games.json
 analyze_style*.py
 *_analysis.py
+node_modules/
+test-results/
+playwright-report/
+package*.json
+playwright.config.js
+eslint.config.js

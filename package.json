@@ -1,0 +1,19 @@
+{
+  "name": "chessbot-frontend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild static/js/app.js --bundle --minify --outfile=static/dist/app.min.js && esbuild static/css/app.css --minify --outfile=static/dist/app.min.css",
+    "format:check": "prettier --check templates static/js static/css tests/frontend",
+    "lint": "eslint static/js tests/frontend",
+    "test:unit": "node --test tests/frontend/unit.test.js",
+    "test:e2e": "playwright test",
+    "test:frontend": "npm run format:check && npm run lint && npm run test:unit && npm run test:e2e"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.0",
+    "esbuild": "0.28.1",
+    "eslint": "10.8.0",
+    "prettier": "3.9.6"
+  }
+}

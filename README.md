@@ -36,6 +36,23 @@ Run the complete test suite and production smoke test:
 .venv/bin/python -m scripts.smoke_test
 ```
 
+Frontend source lives in `templates/`, `static/css/`, and the modules under
+`static/js/`. Production serves the generated files in `static/dist/`.
+
+```sh
+npm install
+npm run build
+npm run format:check
+npm run lint
+npm run test:unit
+npx playwright install chromium
+npm run test:e2e
+```
+
+The browser suite covers desktop and mobile layouts, keyboard access, game
+startup, promotion choice, overflow, and visual regression. Rebuild the
+production assets after changing frontend source.
+
 `/health/live` checks the HTTP process. `/health/ready` verifies that the ONNX
 model loaded at startup and reports whether the Stockfish startup probe passed.
 

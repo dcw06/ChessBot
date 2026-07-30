@@ -168,6 +168,7 @@ class ChessBotEngine:
         # Exposed after each get_move() call so the UI can compute think delays.
         self.last_gap_cp: Optional[int] = None
         self.last_from_book: bool = False
+        self.last_decision_source: str = "neural model"
 
         resolved = stockfish_path or shutil.which("stockfish") or "/usr/games/stockfish"
         try:
@@ -207,15 +208,18 @@ class ChessBotEngine:
     ) -> chess.Move:
         self.last_gap_cp   = None
         self.last_from_book = False
+        self.last_decision_source = "neural model"
 
         # 1. Time pressure
         if clock_remaining < self.time_manager.profile.panic_threshold:
+            self.last_decision_source = "time-pressure policy"
             return self.time_pressure.get_move(board, clock_remaining, self._neural_move)
 
         # 2. Opening book
         book_move = self.opening_book.get_move(board, is_rematch=is_rematch)
         if book_move is not None:
             self.last_from_book = True
+            self.last_decision_source = "opening book"
             return book_move
 
         # 3. Run Stockfish once — reuse the analysis for all downstream decisions.
@@ -233,6 +237,7 @@ class ChessBotEngine:
                 self.last_gap_cp = sf_analysis.gap_cp
                 sf_move = self.stockfish.obvious_move(sf_analysis)
                 if sf_move is not None:
+                    self.last_decision_source = "Stockfish obvious move"
                     return sf_move
                 sf_p = self.stockfish.gap_to_probability(
                     sf_analysis.gap_cp, self.time_manager.time_control
@@ -254,6 +259,7 @@ class ChessBotEngine:
         if rescue is not None and approved(rescue):
             p = max(sf_p, profile.rescue_probability) if sf_p is not None else profile.rescue_probability
             if random.random() < p:
+                self.last_decision_source = "tactical rescue"
                 return rescue
 
         # 5b. Push a hanging undefended pawn to safety.
@@ -261,6 +267,7 @@ class ChessBotEngine:
         if pawn_rescue is not None and approved(pawn_rescue):
             p = max(sf_p, profile.pawn_rescue_probability) if sf_p is not None else profile.pawn_rescue_probability
             if random.random() < p:
+                self.last_decision_source = "pawn safety rule"
                 return pawn_rescue
 
         # 5c. Recapture if the opponent just took one of our pieces.
@@ -270,6 +277,7 @@ class ChessBotEngine:
         if recapture is not None and approved(recapture):
             p = max(sf_p, profile.winning_capture_probability) if sf_p is not None else profile.winning_capture_probability
             if random.random() < p:
+                self.last_decision_source = "recapture rule"
                 return recapture
 
         # 6. Take free or clearly-winning material.
@@ -279,6 +287,7 @@ class ChessBotEngine:
         if winning_capture is not None and approved(winning_capture):
             p = max(sf_p, profile.winning_capture_probability) if sf_p is not None else profile.winning_capture_probability
             if random.random() < p:
+                self.last_decision_source = "winning-capture rule"
                 return winning_capture
 
         # 7. Tactical patterns — each tactic has its own per-tactic weight from the
@@ -292,6 +301,7 @@ class ChessBotEngine:
                 if profile.low_time_threshold > 0 and clock_remaining < profile.low_time_threshold:
                     p *= 0.80  # additional miss rate under time pressure
                 if random.random() < p:
+                    self.last_decision_source = f"tactical rule: {tactic_name}"
                     return tactic_move
 
         # 8. Positional strategy — per-tactic weight replaces the broad strategic_probability.
@@ -301,6 +311,7 @@ class ChessBotEngine:
             if approved(strategic_move):
                 p = tactic_weights.get_weight(strategic_name, self.time_manager.time_control)
                 if random.random() < p:
+                    self.last_decision_source = f"strategy rule: {strategic_name}"
                     return strategic_move
 
         # 9. Neural net — restricted to Stockfish-approved moves when available,

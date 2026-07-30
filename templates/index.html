@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width,initial-scale=1,viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#12151c" />
+    <title>Alan Dai Chess</title>
+    <link rel="stylesheet" href="/static/vendor/chessboard-1.0.0.min.css" />
+    <link rel="stylesheet" href="/static/dist/app.min.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to chess board</a>
+    <div
+      id="connection-banner"
+      class="connection-banner"
+      role="status"
+      aria-live="polite"
+      hidden
+    >
+      <span id="connection-message">Connection lost.</span>
+      <button id="retry-btn" class="button small">Retry</button>
+    </div>
+
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">Behavioral chess engine</p>
+        <h1>Alan Dai</h1>
+      </div>
+      <div class="header-actions">
+        <div
+          id="service-status"
+          class="service-status"
+          aria-label="Service status"
+        >
+          <span id="connection-dot" class="status-dot" aria-hidden="true"></span
+          ><span id="connection-label">Connecting</span>
+          <span id="model-chip" class="status-chip">Model …</span>
+          <span id="stockfish-chip" class="status-chip">Stockfish …</span>
+        </div>
+        <button
+          id="sound-toggle"
+          class="icon-button"
+          aria-label="Toggle sounds"
+          aria-pressed="true"
+        >
+          🔊
+        </button>
+        <button
+          id="coordinates-toggle"
+          class="icon-button"
+          aria-label="Toggle board coordinates"
+          aria-pressed="true"
+        >
+          a1
+        </button>
+        <button
+          id="theme-toggle"
+          class="icon-button"
+          aria-label="Switch color theme"
+        >
+          ◐
+        </button>
+        <button
+          id="settings-btn"
+          class="icon-button"
+          aria-label="Open display settings"
+        >
+          ⚙
+        </button>
+      </div>
+    </header>
+
+    <nav id="main-nav" class="tabs" aria-label="Application sections">
+      <button
+        class="nav-tab active"
+        id="tab-play"
+        data-tab="play"
+        aria-selected="true"
+      >
+        Play
+      </button>
+      <button
+        class="nav-tab"
+        id="tab-analyze"
+        data-tab="analyze"
+        aria-selected="false"
+      >
+        Analyze
+      </button>
+    </nav>
+
+    <main id="main-content">
+      <section id="play-section" aria-labelledby="tab-play">
+        <div id="setup-panel" class="card setup-card">
+          <div class="setup-heading">
+            <p class="eyebrow">New game</p>
+            <h2>Choose your challenge</h2>
+          </div>
+          <fieldset>
+            <legend>Time control</legend>
+            <div class="segmented-control">
+              <button class="choice-button tc-btn" data-tc="bullet">
+                1 min<span>Bullet</span>
+              </button>
+              <button class="choice-button tc-btn selected" data-tc="blitz">
+                3 min<span>Blitz</span>
+              </button>
+              <button class="choice-button tc-btn" data-tc="rapid">
+                10 min<span>Rapid</span>
+              </button>
+              <button class="choice-button tc-btn" data-tc="custom">
+                Custom<span>Clock</span>
+              </button>
+            </div>
+            <div id="custom-time-fields" class="custom-time-fields" hidden>
+              <label
+                >Minutes<input
+                  id="custom-minutes"
+                  type="number"
+                  min="1"
+                  max="180"
+                  value="5"
+                  inputmode="numeric"
+              /></label>
+              <label
+                >Increment<input
+                  id="custom-increment"
+                  type="number"
+                  min="0"
+                  max="60"
+                  value="3"
+                  inputmode="numeric"
+                /><span>seconds</span></label
+              >
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>Play as</legend>
+            <div class="segmented-control two-up">
+              <button
+                class="choice-button color-btn selected"
+                data-color="white"
+              >
+                <span class="piece-symbol">♙</span>White
+              </button>
+              <button class="choice-button color-btn" data-color="black">
+                <span class="piece-symbol">♟</span>Black
+              </button>
+            </div>
+          </fieldset>
+          <button id="start-btn" class="button primary large">
+            Start game
+          </button>
+          <p class="shortcut-hint">
+            Shortcut: <kbd>N</kbd> new game · <kbd>F</kbd> flip board ·
+            <kbd>R</kbd> resign
+          </p>
+        </div>
+
+        <div id="game-panel" class="game-layout" hidden>
+          <section class="board-column" aria-label="Live chess game">
+            <div class="player-strip strip-top" id="top-strip">
+              <div class="player-avatar" id="top-avatar" aria-hidden="true">
+                ♟
+              </div>
+              <div class="player-meta">
+                <strong id="top-name">Alan Dai</strong
+                ><span id="top-sub"></span>
+              </div>
+              <div class="player-clock" id="top-time" role="timer">3:00</div>
+            </div>
+            <div id="board-shell" class="board-shell">
+              <div
+                id="live-eval-wrap"
+                class="vertical-eval"
+                hidden
+                aria-label="Live evaluation"
+              >
+                <div id="live-eval-fill"></div>
+                <span id="live-eval-label">0.0</span>
+              </div>
+              <div id="board-wrap">
+                <div id="board" aria-label="Interactive chess board"></div>
+              </div>
+              <div id="board-loader" class="board-loader" hidden>
+                <span class="spinner"></span
+                ><strong>Alan Dai is thinking</strong
+                ><small id="thinking-detail">Evaluating the position…</small>
+              </div>
+            </div>
+            <div class="player-strip strip-bottom" id="bottom-strip">
+              <div class="player-avatar" id="bottom-avatar" aria-hidden="true">
+                ♙
+              </div>
+              <div class="player-meta">
+                <strong id="bottom-name">You</strong
+                ><span id="bottom-sub"></span>
+              </div>
+              <div class="player-clock" id="bottom-time" role="timer">3:00</div>
+            </div>
+          </section>
+
+          <aside class="game-sidebar card">
+            <div id="turn-status" class="turn-status">
+              <span class="status-dot"></span><span id="status">Ready</span>
+            </div>
+            <div class="game-facts">
+              <div>
+                <span>Opening</span
+                ><strong id="opening-name">Starting position</strong>
+              </div>
+              <div>
+                <span>Last decision</span
+                ><strong id="decision-source">—</strong>
+              </div>
+            </div>
+            <div
+              id="captured-pieces"
+              class="captured-pieces"
+              aria-label="Captured pieces and material"
+            ></div>
+            <div id="move-list" class="move-list" aria-label="Move history">
+              <span class="muted">No moves yet</span>
+            </div>
+            <div id="action-row" class="action-row">
+              <button id="undo-btn" class="button secondary">Undo</button>
+              <button id="abort-btn" class="button secondary">Abort</button>
+              <button id="resign-btn" class="button danger">Resign</button>
+              <button id="rematch-btn" class="button primary" hidden>
+                Play again
+              </button>
+              <button id="switch-color-btn" class="button secondary" hidden>
+                Switch colors
+              </button>
+              <button id="review-btn" class="button secondary" hidden>
+                Review
+              </button>
+              <button id="new-game-btn" class="button secondary" hidden>
+                New game
+              </button>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section id="analyze-section" aria-labelledby="tab-analyze" hidden>
+        <div class="analysis-toolbar card">
+          <div class="toolbar-row">
+            <button id="import-pgn-btn" class="button secondary">
+              Import PGN
+            </button>
+            <button id="import-fen-btn" class="button secondary">
+              Import FEN
+            </button>
+            <button id="export-pgn-btn" class="button secondary">
+              Export PGN
+            </button>
+            <button id="copy-fen-btn" class="button secondary">Copy FEN</button>
+            <button id="share-analysis-btn" class="button secondary">
+              Share
+            </button>
+            <button id="download-report-btn" class="button secondary">
+              Report
+            </button>
+            <input
+              id="analysis-file"
+              type="file"
+              accept=".pgn,text/plain"
+              hidden
+            />
+          </div>
+          <div class="engine-options">
+            <label
+              >Lines<select id="engine-lines">
+                <option>1</option>
+                <option selected>3</option>
+                <option>5</option>
+              </select></label
+            >
+            <label
+              >Analysis<select id="engine-time">
+                <option value="0.15">Fast</option>
+                <option value="0.3" selected>Balanced</option>
+                <option value="1">Deep</option>
+              </select></label
+            >
+            <label class="toggle"
+              ><input id="live-eval-toggle" type="checkbox" /><span
+                >Live evaluation</span
+              ></label
+            >
+          </div>
+        </div>
+
+        <div id="recent-games-panel" class="card recent-games-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Chess.com</p>
+              <h2>Recent games</h2>
+            </div>
+            <button
+              id="refresh-games-btn"
+              class="icon-button"
+              aria-label="Refresh recent games"
+            >
+              ↻
+            </button>
+          </div>
+          <div class="filter-row">
+            <label class="search-field"
+              ><span class="sr-only">Search games</span
+              ><input
+                id="game-search"
+                type="search"
+                placeholder="Search opponent or opening"
+            /></label>
+            <select id="game-result-filter" aria-label="Filter by result">
+              <option value="">All results</option>
+              <option value="W">Wins</option>
+              <option value="L">Losses</option>
+              <option value="D">Draws</option>
+            </select>
+            <select id="game-speed-filter" aria-label="Filter by speed">
+              <option value="">All speeds</option>
+              <option value="bullet">Bullet</option>
+              <option value="blitz">Blitz</option>
+              <option value="rapid">Rapid</option>
+            </select>
+          </div>
+          <div id="recent-games" class="recent-games">
+            <div class="skeleton-list">
+              <span></span><span></span><span></span>
+            </div>
+          </div>
+          <div class="pagination">
+            <button id="games-prev" class="button small">Previous</button
+            ><span id="games-page">1 / 1</span
+            ><button id="games-next" class="button small">Next</button>
+          </div>
+        </div>
+
+        <div id="av-game-view" class="analysis-layout" hidden>
+          <section class="analysis-board-column">
+            <div class="analysis-title-row">
+              <button id="analysis-back-btn" class="button secondary">
+                ← Games</button
+              ><strong id="av-game-title"></strong>
+            </div>
+            <div id="av-eval-wrap" aria-label="Position evaluation">
+              <div id="av-eval-fill"></div>
+              <div id="av-eval-label">–</div>
+            </div>
+            <div class="player-strip strip-top">
+              <div class="player-avatar" id="av-top-avatar">♟</div>
+              <div class="player-meta">
+                <strong id="av-top-name">Opponent</strong
+                ><span id="av-top-sub">Black</span>
+              </div>
+            </div>
+            <div id="av-board-wrap">
+              <div id="av-board" aria-label="Analysis chess board"></div>
+            </div>
+            <div class="player-strip strip-bottom">
+              <div class="player-avatar" id="av-bottom-avatar">♙</div>
+              <div class="player-meta">
+                <strong id="av-bottom-name">You</strong
+                ><span id="av-bottom-sub">White</span>
+              </div>
+            </div>
+          </section>
+          <aside class="analysis-sidebar card">
+            <div id="analysis-progress" class="analysis-progress" hidden>
+              <span class="spinner"></span><span>Analyzing position…</span>
+            </div>
+            <div id="av-lines-panel" class="engine-lines"></div>
+            <div id="av-move-list" class="move-tree"></div>
+            <div class="analysis-navigation">
+              <button
+                class="button secondary"
+                data-analysis-nav="start"
+                aria-label="First move"
+              >
+                |◀
+              </button>
+              <button
+                class="button secondary"
+                data-analysis-nav="back"
+                aria-label="Previous move"
+              >
+                ◀
+              </button>
+              <button
+                class="button secondary"
+                data-analysis-nav="forward"
+                aria-label="Next move"
+              >
+                ▶
+              </button>
+              <button
+                class="button secondary"
+                data-analysis-nav="end"
+                aria-label="Last move"
+              >
+                ▶|
+              </button>
+            </div>
+            <div class="toolbar-row">
+              <button id="av-return-btn" class="button secondary">
+                Return to game position</button
+              ><button id="av-reset-btn" class="button secondary">
+                Reset analysis
+              </button>
+            </div>
+          </aside>
+        </div>
+      </section>
+    </main>
+
+    <div
+      id="toast-region"
+      class="toast-region"
+      aria-live="polite"
+      aria-atomic="true"
+    ></div>
+    <div id="sr-announcer" class="sr-only" aria-live="assertive"></div>
+
+    <dialog id="confirm-dialog">
+      <form method="dialog">
+        <h2 id="confirm-title">Are you sure?</h2>
+        <p id="confirm-message"></p>
+        <div class="dialog-actions">
+          <button value="cancel" class="button secondary">Cancel</button
+          ><button id="confirm-accept" value="confirm" class="button danger">
+            Confirm
+          </button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="promotion-dialog">
+      <form method="dialog">
+        <h2>Choose promotion</h2>
+        <div class="promotion-options">
+          <button value="q" aria-label="Promote to queen">♛</button
+          ><button value="r" aria-label="Promote to rook">♜</button
+          ><button value="b" aria-label="Promote to bishop">♝</button
+          ><button value="n" aria-label="Promote to knight">♞</button>
+        </div>
+        <button value="cancel" class="button secondary">Cancel</button>
+      </form>
+    </dialog>
+    <dialog id="result-dialog">
+      <form method="dialog">
+        <div id="result-icon" class="result-icon">♟</div>
+        <h2 id="result-title">Game over</h2>
+        <p id="result-message"></p>
+        <div class="dialog-actions">
+          <button value="close" class="button secondary">Close</button
+          ><button id="result-rematch" value="rematch" class="button primary">
+            Play again
+          </button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="input-dialog">
+      <form method="dialog">
+        <h2 id="input-title">Import</h2>
+        <textarea id="input-value" rows="8"></textarea>
+        <div class="dialog-actions">
+          <button value="cancel" class="button secondary">Cancel</button
+          ><button value="submit" class="button primary">Import</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="settings-dialog">
+      <form method="dialog">
+        <h2>Display settings</h2>
+        <label
+          >Board theme<select id="board-theme">
+            <option value="classic">Classic</option>
+            <option value="ocean">Ocean</option>
+            <option value="forest">Forest</option>
+            <option value="mono">High contrast</option>
+          </select></label
+        ><label
+          >Piece style<select id="piece-theme">
+            <option value="wikipedia">Wikipedia</option>
+            <option value="mono">Monochrome</option>
+            <option value="warm">Warm</option>
+          </select></label
+        ><label class="toggle"
+          ><input id="high-contrast-toggle" type="checkbox" /><span
+            >High contrast</span
+          ></label
+        >
+        <div class="dialog-actions">
+          <button value="close" class="button primary">Done</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/static/vendor/jquery-3.7.1.min.js"></script>
+    <script src="/static/vendor/chessboard-1.0.0.min.js"></script>
+    <script src="/static/vendor/chess-0.10.3.min.js"></script>
+    <script src="/static/dist/app.min.js" defer></script>
+  </body>
+</html>

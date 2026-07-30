@@ -56,8 +56,8 @@ class FakeTimer:
         return 0.01
 
 
-def fake_state(tc, bot_color):
-    total = float(web_app.TIME_CONTROLS[tc])
+def fake_state(tc, bot_color, total_seconds=None, increment_seconds=0):
+    total = float(total_seconds or web_app.TIME_CONTROLS[tc])
     return {
         "lock": threading.RLock(),
         "engine": FakeEngine(),
@@ -66,7 +66,7 @@ def fake_state(tc, bot_color):
         "bot_color": chess.WHITE if bot_color == "white" else chess.BLACK,
         "bot_clock": total,
         "human_clock": total,
-        "last_tick": time.time(),
+        "last_tick": time.monotonic(),
         "over": False,
         "result": None,
         "is_rematch": False,
@@ -75,6 +75,9 @@ def fake_state(tc, bot_color):
         "version": 0,
         "bot_busy": False,
         "last_access": time.monotonic(),
+        "increment": float(increment_seconds),
+        "snapshots": [],
+        "decision_source": "—",
     }
 
 
@@ -145,6 +148,37 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(
                 client.post("/api/eval", json={"fen": "bad"}).status_code, 429
             )
+
+    def test_custom_clock_and_increment_are_applied(self):
+        client = web_app.app.test_client()
+        response = client.post(
+            "/new_game",
+            json={
+                "tc": "blitz",
+                "bot_color": "black",
+                "initial_seconds": 300,
+                "increment_seconds": 3,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["increment"], 3)
+        self.assertGreater(response.get_json()["human_clock"], 299)
+
+    def test_undo_restores_position_before_complete_turn(self):
+        client = web_app.app.test_client()
+        self._new_game(client, bot_color="black")
+        moved = client.post(
+            "/move", json={"uci": "e2e4", "expected_version": 0}
+        )
+        self.assertEqual(moved.status_code, 200)
+        bot = client.post(
+            "/bot_move", json={"expected_version": moved.get_json()["version"]}
+        )
+        self.assertEqual(bot.status_code, 200)
+        undone = client.post("/undo")
+        self.assertEqual(undone.status_code, 200)
+        self.assertEqual(undone.get_json()["moves"], [])
+        self.assertEqual(undone.get_json()["fen"], chess.Board().fen())
 
     def test_capacity_is_checked_before_engine_creation(self):
         client = web_app.app.test_client()
