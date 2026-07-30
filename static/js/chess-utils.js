@@ -23,3 +23,15 @@ export function evaluationPercent(cp, isMate = false) {
   if (isMate) return cp > 0 ? 100 : 0;
   return Math.max(3, Math.min(97, 50 + 50 * Math.tanh(cp / 300)));
 }
+
+export function classifyMoveQuality(previousCp, currentCp, moverWasWhite) {
+  if (!Number.isFinite(previousCp) || !Number.isFinite(currentCp)) return "";
+  const loss = Math.max(
+    0,
+    moverWasWhite ? previousCp - currentCp : currentCp - previousCp,
+  );
+  if (loss >= 250) return "blunder";
+  if (loss >= 120) return "mistake";
+  if (loss >= 60) return "inaccuracy";
+  return "";
+}

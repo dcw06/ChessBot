@@ -2,6 +2,7 @@ import threading
 import time
 import sys
 import types
+import tempfile
 import unittest
 from unittest import mock
 
@@ -78,12 +79,19 @@ def fake_state(tc, bot_color, total_seconds=None, increment_seconds=0):
         "increment": float(increment_seconds),
         "snapshots": [],
         "decision_source": "—",
+        "time_control": tc,
+        "saved": False,
     }
 
 
 class WebAppTests(unittest.TestCase):
     def setUp(self):
         web_app.app.config.update(TESTING=True)
+        self.temp_directory = tempfile.TemporaryDirectory()
+        self.saved_path_patcher = mock.patch.object(
+            web_app, "LOCAL_GAMES_PATH", web_app.Path(self.temp_directory.name) / "games.json"
+        )
+        self.saved_path_patcher.start()
         self.new_state_patcher = mock.patch.object(
             web_app, "_new_state", side_effect=fake_state
         )
@@ -95,6 +103,8 @@ class WebAppTests(unittest.TestCase):
 
     def tearDown(self):
         self.new_state_patcher.stop()
+        self.saved_path_patcher.stop()
+        self.temp_directory.cleanup()
         with web_app._games_lock:
             web_app._games.clear()
 
@@ -163,6 +173,30 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["increment"], 3)
         self.assertGreater(response.get_json()["human_clock"], 299)
+
+    def test_only_six_latest_local_games_are_persisted(self):
+        for index in range(7):
+            state = fake_state("blitz", "black")
+            state["board"].push_san("e4")
+            state["moves"] = ["e4"]
+            state["over"] = True
+            state["result"] = f"You win by checkmate! #{index}"
+            web_app._persist_finished_game(state)
+        response = web_app.app.test_client().get("/api/local-games")
+        games = response.get_json()["games"]
+        self.assertEqual(len(games), 6)
+        self.assertIn("#6", games[0]["result_text"])
+        self.assertNotIn("#0", [game["result_text"] for game in games])
+
+    def test_frontend_security_and_cache_headers(self):
+        client = web_app.app.test_client()
+        page = client.get("/")
+        self.assertIn("script-src 'self'", page.headers["Content-Security-Policy"])
+        self.assertNotIn("script-src 'self' 'unsafe-inline'", page.headers["Content-Security-Policy"])
+        asset = client.get("/static/dist/app.min.js")
+        self.assertIn("public", asset.headers["Cache-Control"])
+        self.assertNotIn("no-cache", asset.headers["Cache-Control"])
+        asset.close()
 
     def test_undo_restores_position_before_complete_turn(self):
         client = web_app.app.test_client()

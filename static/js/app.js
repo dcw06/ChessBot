@@ -1,24 +1,33 @@
-import { api, post } from "./api.js";
+import { api, CancelledRequest, post } from "./api.js";
 import { playSound, setSoundEnabled, soundEnabled } from "./sounds.js";
-import {
-  analysisKeyHandler,
-  initAnalysis,
-  loadRecentGames,
-  openGame,
-} from "./analysis.js";
 import { classifyResult, formatClock } from "./chess-utils.js";
 
 const $ = (id) => document.getElementById(id);
+function stored(key, fallback) {
+  try {
+    return localStorage.getItem(key) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+function store(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* Preferences remain in memory. */
+  }
+}
 const prefs = {
-  theme: localStorage.getItem("chessbot:theme") || "dark",
-  coordinates: localStorage.getItem("chessbot:coordinates") !== "off",
-  boardTheme: localStorage.getItem("chessbot:board-theme") || "classic",
-  pieceTheme: localStorage.getItem("chessbot:piece-theme") || "wikipedia",
-  highContrast: localStorage.getItem("chessbot:contrast") === "high",
+  theme: stored("chessbot:theme", "dark"),
+  coordinates: stored("chessbot:coordinates", "on") !== "off",
+  boardTheme: stored("chessbot:board-theme", "classic"),
+  pieceTheme: stored("chessbot:piece-theme", "wikipedia"),
+  highContrast: stored("chessbot:contrast", "normal") === "high",
 };
 window.chessbotPrefs = prefs;
 
 let board;
+let boardObserver;
 let game = new Chess();
 let botColor = "black";
 let humanColor = "white";
@@ -33,6 +42,16 @@ let lastState = null;
 let lastMoveCount = 0;
 let lastEvaluatedVersion = -1;
 let clocks = { bot: 180, human: 180, at: performance.now(), turn: "white" };
+const clockAnnouncements = { top: new Set(), bottom: new Set() };
+let analysisModule;
+
+async function getAnalysis() {
+  if (!analysisModule) {
+    analysisModule = await import("./analysis.js");
+    analysisModule.initAnalysis();
+  }
+  return analysisModule;
+}
 
 function toast(message, kind = "info") {
   const element = document.createElement("div");
@@ -72,9 +91,17 @@ async function refreshHealth() {
   } catch (error) {
     const data = error.data || {};
     $("model-chip").textContent = `Model ${data.model || "unavailable"}`;
+    $("model-chip").className = "status-chip error";
     $("stockfish-chip").textContent =
       `Stockfish ${data.stockfish || "unavailable"}`;
-    setConnected(error.status === 503, error.message);
+    $("stockfish-chip").className = "status-chip error";
+    setConnected(
+      false,
+      error.status === 503
+        ? "Services are temporarily unavailable. Retry shortly."
+        : error.message,
+    );
+    if (error.status === 503) $("connection-label").textContent = "Maintenance";
   }
 }
 
@@ -82,8 +109,7 @@ function setBusy(busy, text = "Working…") {
   requestBusy = busy;
   document.body.classList.toggle("request-busy", busy);
   $("start-btn").disabled = busy;
-  $("board-loader").hidden = !busy || gameOver;
-  if (busy) $("thinking-detail").textContent = text;
+  document.body.dataset.busyLabel = busy ? text : "";
   updateInteraction();
 }
 
@@ -189,6 +215,10 @@ function boardClick(event) {
     .closest('[class*="square-"]')
     ?.className.match(/square-([a-h][1-8])/)?.[1];
   if (!square) return clearSelection();
+  activateSquare(square);
+}
+
+function activateSquare(square) {
   const piece = game.get(square);
   if (selectedSquare) {
     if (square === selectedSquare) return clearSelection();
@@ -197,6 +227,61 @@ function boardClick(event) {
     clearSelection();
     makeMove(from, square);
   } else if (piece?.color === humanColor[0]) selectSquare(square);
+}
+
+function makeBoardAccessible(
+  focusSquare = humanColor === "white" ? "e2" : "e7",
+) {
+  const pieceNames = {
+    p: "pawn",
+    n: "knight",
+    b: "bishop",
+    r: "rook",
+    q: "queen",
+    k: "king",
+  };
+  document.querySelectorAll("#board [class*='square-']").forEach((square) => {
+    const coordinate = square.className.match(/square-([a-h][1-8])/)?.[1];
+    if (!coordinate) return;
+    const piece = game.get(coordinate);
+    square.setAttribute("role", "button");
+    square.setAttribute("tabindex", coordinate === focusSquare ? "0" : "-1");
+    square.onkeydown = boardKeydown;
+    square.setAttribute(
+      "aria-label",
+      piece
+        ? `${coordinate}, ${piece.color === "w" ? "white" : "black"} ${pieceNames[piece.type]}`
+        : `${coordinate}, empty`,
+    );
+  });
+}
+
+function boardKeydown(event) {
+  event.stopPropagation();
+  const current = event.target.closest('[class*="square-"]');
+  const coordinate = current?.className.match(/square-([a-h][1-8])/)?.[1];
+  if (!coordinate) return;
+  if (["Enter", " "].includes(event.key)) {
+    event.preventDefault();
+    activateSquare(coordinate);
+    return;
+  }
+  const delta = {
+    ArrowLeft: [-1, 0],
+    ArrowRight: [1, 0],
+    ArrowUp: [0, 1],
+    ArrowDown: [0, -1],
+  }[event.key];
+  if (!delta) return;
+  event.preventDefault();
+  const file = Math.max(
+    0,
+    Math.min(7, coordinate.charCodeAt(0) - 97 + delta[0]),
+  );
+  const rank = Math.max(1, Math.min(8, Number(coordinate[1]) + delta[1]));
+  const next = `${"abcdefgh"[file]}${rank}`;
+  makeBoardAccessible(next);
+  document.querySelector(`#board .square-${next}`)?.focus();
 }
 
 function selectSquare(square) {
@@ -272,10 +357,19 @@ function initializeBoard(state) {
     onDragStart,
     onDrop,
     onSnapEnd,
-    onMoveEnd: applyHighlights,
+    onMoveEnd: () => {
+      applyHighlights();
+      makeBoardAccessible();
+    },
     pieceTheme: "/static/pieces/{piece}.png",
   });
   $("board").addEventListener("click", boardClick, true);
+  $("board").addEventListener("keydown", boardKeydown);
+  boardObserver?.disconnect();
+  boardObserver = new window.MutationObserver(() => makeBoardAccessible());
+  boardObserver.observe($("board"), { childList: true, subtree: true });
+  makeBoardAccessible();
+  setTimeout(makeBoardAccessible, 0);
   resizeBoards();
 }
 
@@ -309,6 +403,7 @@ function soundForMove(move, state) {
 
 function handleState(state, localMove = null) {
   if (state.error) return showError({ message: state.error, data: state });
+  if (Number.isInteger(state.version) && state.version < serverVersion) return;
   const previousMoves = lastMoveCount;
   lastState = state;
   serverVersion = Number.isInteger(state.version)
@@ -335,6 +430,10 @@ function handleState(state, localMove = null) {
     playSound(
       soundForMove(localMove || game.history({ verbose: true }).at(-1), state),
     );
+  const moveAnnouncement =
+    lastMoveCount > previousMoves
+      ? `${state.moves.at(-1)}${state.in_check ? ", check" : ""}. `
+      : "";
   gameOver = Boolean(state.over);
   if ($("live-eval-toggle").checked && state.version !== lastEvaluatedVersion) {
     lastEvaluatedVersion = state.version;
@@ -350,7 +449,9 @@ function handleState(state, localMove = null) {
   const yourTurn = state.turn === humanColor;
   $("status").textContent = yourTurn ? "Your turn" : "Alan Dai is thinking";
   $("turn-status").classList.toggle("your-turn", yourTurn);
-  announce(yourTurn ? "Your turn." : "Alan Dai is thinking.");
+  announce(
+    `${moveAnnouncement}${yourTurn ? "Your turn." : "Alan Dai is thinking."}`,
+  );
 }
 
 async function updateLiveEvaluation(fen) {
@@ -370,7 +471,7 @@ async function updateLiveEvaluation(fen) {
       ? `M${Math.abs(data.mate)}`
       : `${data.cp >= 0 ? "+" : ""}${(data.cp / 100).toFixed(1)}`;
   } catch (error) {
-    if (error.name !== "AbortError")
+    if (!(error instanceof CancelledRequest))
       toast("Live evaluation is unavailable.", "error");
   }
 }
@@ -488,6 +589,15 @@ function setClock(element, seconds) {
   element.textContent = formatClock(seconds);
   element.classList.toggle("warning", seconds < 30);
   element.classList.toggle("critical", seconds < 10);
+  const key = element === $("top-time") ? "top" : "bottom";
+  for (const threshold of [30, 10]) {
+    if (seconds < threshold && !clockAnnouncements[key].has(threshold)) {
+      clockAnnouncements[key].add(threshold);
+      announce(
+        `${element === $("bottom-time") ? "Your" : "Opponent"} clock is below ${threshold} seconds.`,
+      );
+    }
+  }
 }
 
 function updateGameButtons() {
@@ -509,6 +619,7 @@ function showError(error) {
 }
 
 async function startGame({ rematch = false, switchColor = false } = {}) {
+  if (requestBusy) return;
   if (
     !gameOver &&
     !(await confirmAction(
@@ -525,6 +636,20 @@ async function startGame({ rematch = false, switchColor = false } = {}) {
   if (tc === "custom") {
     initial = Number($("custom-minutes").value) * 60;
     increment = Number($("custom-increment").value);
+    if (
+      !Number.isFinite(initial) ||
+      initial < 60 ||
+      initial > 10800 ||
+      !Number.isFinite(increment) ||
+      increment < 0 ||
+      increment > 60
+    ) {
+      toast(
+        "Choose 1–180 minutes and an increment from 0–60 seconds.",
+        "error",
+      );
+      return;
+    }
     tc = initial <= 90 ? "bullet" : initial <= 300 ? "blitz" : "rapid";
   }
   const selectedColor = document.querySelector(".color-btn.selected").dataset
@@ -552,7 +677,10 @@ async function startGame({ rematch = false, switchColor = false } = {}) {
     $("game-panel").hidden = false;
     gameOver = false;
     lastMoveCount = 0;
+    clockAnnouncements.top.clear();
+    clockAnnouncements.bottom.clear();
     initializeBoard(state);
+    serverVersion = -1;
     handleState(state);
     startPolling();
     if (state.turn === botColor) await requestBotMove();
@@ -601,7 +729,7 @@ async function gameAction(path, confirmation) {
   }
 }
 
-function switchTab(tab) {
+async function switchTab(tab) {
   const analyze = tab === "analyze";
   $("play-section").hidden = analyze;
   $("analyze-section").hidden = !analyze;
@@ -609,8 +737,9 @@ function switchTab(tab) {
     const active = button.dataset.tab === tab;
     button.classList.toggle("active", active);
     button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
   });
-  if (analyze) loadRecentGames();
+  if (analyze) (await getAnalysis()).loadRecentGames();
   resizeBoards();
 }
 
@@ -646,6 +775,11 @@ function bindEvents() {
         .querySelectorAll(".tc-btn")
         .forEach((item) => item.classList.remove("selected"));
       button.classList.add("selected");
+      document
+        .querySelectorAll(".tc-btn")
+        .forEach((item) =>
+          item.setAttribute("aria-pressed", String(item === button)),
+        );
       $("custom-time-fields").hidden = button.dataset.tc !== "custom";
     }),
   );
@@ -655,6 +789,11 @@ function bindEvents() {
         .querySelectorAll(".color-btn")
         .forEach((item) => item.classList.remove("selected"));
       button.classList.add("selected");
+      document
+        .querySelectorAll(".color-btn")
+        .forEach((item) =>
+          item.setAttribute("aria-pressed", String(item === button)),
+        );
     }),
   );
   $("start-btn").addEventListener("click", () => startGame());
@@ -689,9 +828,9 @@ function bindEvents() {
     gameOver = true;
     stopPolling();
   });
-  $("review-btn").addEventListener("click", () => {
-    switchTab("analyze");
-    openGame({
+  $("review-btn").addEventListener("click", async () => {
+    await switchTab("analyze");
+    (await getAnalysis()).openGame({
       pgn: game.pgn(),
       user_color: humanColor,
       opponent: "Alan Dai",
@@ -702,6 +841,9 @@ function bindEvents() {
   $("result-rematch").addEventListener("click", () =>
     setTimeout(() => startGame({ rematch: true }), 0),
   );
+  $("result-switch-color").addEventListener("click", () =>
+    setTimeout(() => startGame({ rematch: true, switchColor: true }), 0),
+  );
   $("sound-toggle").addEventListener("click", () => {
     setSoundEnabled(!soundEnabled());
     applyPreferences();
@@ -709,15 +851,12 @@ function bindEvents() {
   });
   $("theme-toggle").addEventListener("click", () => {
     prefs.theme = prefs.theme === "dark" ? "light" : "dark";
-    localStorage.setItem("chessbot:theme", prefs.theme);
+    store("chessbot:theme", prefs.theme);
     applyPreferences();
   });
   $("coordinates-toggle").addEventListener("click", () => {
     prefs.coordinates = !prefs.coordinates;
-    localStorage.setItem(
-      "chessbot:coordinates",
-      prefs.coordinates ? "on" : "off",
-    );
+    store("chessbot:coordinates", prefs.coordinates ? "on" : "off");
     if (lastState) initializeBoard(lastState);
     applyPreferences();
   });
@@ -726,20 +865,17 @@ function bindEvents() {
   );
   $("board-theme").addEventListener("change", (event) => {
     prefs.boardTheme = event.target.value;
-    localStorage.setItem("chessbot:board-theme", prefs.boardTheme);
+    store("chessbot:board-theme", prefs.boardTheme);
     applyPreferences();
   });
   $("piece-theme").addEventListener("change", (event) => {
     prefs.pieceTheme = event.target.value;
-    localStorage.setItem("chessbot:piece-theme", prefs.pieceTheme);
+    store("chessbot:piece-theme", prefs.pieceTheme);
     applyPreferences();
   });
   $("high-contrast-toggle").addEventListener("change", (event) => {
     prefs.highContrast = event.target.checked;
-    localStorage.setItem(
-      "chessbot:contrast",
-      prefs.highContrast ? "high" : "normal",
-    );
+    store("chessbot:contrast", prefs.highContrast ? "high" : "normal");
     applyPreferences();
   });
   $("live-eval-toggle").addEventListener("change", (event) => {
@@ -758,7 +894,17 @@ function bindEvents() {
   });
   window.addEventListener("resize", resizeBoards);
   document.addEventListener("keydown", (event) => {
-    analysisKeyHandler(event);
+    analysisModule?.analysisKeyHandler(event);
+    if (
+      event.target.matches('[role="tab"]') &&
+      ["ArrowLeft", "ArrowRight"].includes(event.key)
+    ) {
+      event.preventDefault();
+      const tab = event.target.dataset.tab === "play" ? "analyze" : "play";
+      switchTab(tab);
+      document.querySelector(`[data-tab="${tab}"]`).focus();
+      return;
+    }
     if (["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName)) return;
     if (event.key.toLowerCase() === "n") startGame();
     if (event.key.toLowerCase() === "r" && !gameOver) $("resign-btn").click();
@@ -768,6 +914,5 @@ function bindEvents() {
 
 applyPreferences();
 bindEvents();
-initAnalysis();
 refreshHealth();
 setInterval(refreshHealth, 30000);

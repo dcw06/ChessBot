@@ -1,8 +1,23 @@
-import { api, post } from "./api.js";
-import { evaluationPercent } from "./chess-utils.js";
+import { api, CancelledRequest, post } from "./api.js";
+import { classifyMoveQuality, evaluationPercent } from "./chess-utils.js";
 
 const $ = (id) => document.getElementById(id);
+function storageGet(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+function storageSet(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* Cache is optional. */
+  }
+}
 let board;
+let boardObserver;
 let viewer = new Chess();
 let mainMoves = [];
 let mainIndex = 0;
@@ -13,6 +28,11 @@ let page = 1;
 const pageSize = 8;
 let debounce;
 const evaluations = new Map();
+let analysisGeneration = 0;
+let returnIndex = 0;
+let sourcePgn = "";
+let analysisModified = false;
+let analysisSelected = null;
 
 function button(label, className = "button secondary") {
   const element = document.createElement("button");
@@ -59,7 +79,7 @@ function renderGames() {
     const detail = document.createElement("p");
     detail.textContent = games.length
       ? "Try clearing one of the filters."
-      : "Import a PGN or refresh when Chess.com is available.";
+      : "Complete a game against Alan Dai to see it here.";
     empty.append(title, detail, button("Import PGN", "button primary"));
     empty.lastElementChild.addEventListener("click", () =>
       $("import-pgn-btn").click(),
@@ -86,31 +106,41 @@ function renderGames() {
 }
 
 export async function loadRecentGames(force = false) {
-  const cached = localStorage.getItem("chessbot:recent-games");
+  const cached = storageGet("chessbot:recent-games");
   if (!force && cached) {
     try {
       const parsed = JSON.parse(cached);
-      if (Date.now() - parsed.savedAt < 300000) {
-        games = parsed.games;
+      if (parsed.version === 2 && Date.now() - parsed.savedAt < 300000) {
+        games = parsed.games.filter((game) => game.source === "local");
         renderGames();
         return;
       }
     } catch {
-      localStorage.removeItem("chessbot:recent-games");
+      try {
+        localStorage.removeItem("chessbot:recent-games");
+      } catch {
+        /* Ignore unavailable storage. */
+      }
     }
   }
-  $("recent-games").innerHTML =
-    '<div class="skeleton-list"><span></span><span></span><span></span></div>';
+  const skeleton = document.createElement("div");
+  skeleton.className = "skeleton-list";
+  skeleton.append(
+    document.createElement("span"),
+    document.createElement("span"),
+    document.createElement("span"),
+  );
+  $("recent-games").replaceChildren(skeleton);
   try {
-    const data = await api("/api/games", {
-      key: "recent-games",
-      timeout: 20000,
+    const data = await api("/api/local-games", {
+      key: "local-games",
+      timeout: 5000,
       retries: 1,
     });
     games = Array.isArray(data.games) ? data.games : [];
-    localStorage.setItem(
+    storageSet(
       "chessbot:recent-games",
-      JSON.stringify({ savedAt: Date.now(), games }),
+      JSON.stringify({ version: 2, savedAt: Date.now(), games }),
     );
     renderGames();
   } catch (error) {
@@ -122,14 +152,16 @@ export async function loadRecentGames(force = false) {
 
 function resetTo(index) {
   if (variation.length)
-    branches.set(
+    saveBranch(
       mainIndex,
       variation.map((move) => move.san),
     );
   mainIndex = Math.max(0, Math.min(index, mainMoves.length));
+  returnIndex = mainIndex;
   viewer = new Chess();
   for (let i = 0; i < mainIndex; i += 1) viewer.move(mainMoves[i]);
   variation = [];
+  analysisModified ||= mainIndex !== 0;
   board.position(viewer.fen(), false);
   renderMoveTree();
   scheduleAnalysis();
@@ -160,24 +192,128 @@ function renderMoveTree() {
     moveButton.addEventListener("click", () => resetTo(index + 1));
     list.append(moveButton);
   });
-  branches.forEach((moves, branchIndex) => {
-    const branch = document.createElement("div");
-    branch.className = "variation-branch";
-    branch.textContent = `After move ${branchIndex}: ${moves.join(" ")}`;
-    list.append(branch);
+  branches.forEach((lines, branchIndex) => {
+    lines.forEach((moves) => {
+      const branch = button(
+        `After move ${branchIndex}: ${moves.join(" ")}`,
+        "variation-branch",
+      );
+      branch.addEventListener("click", () => {
+        resetTo(branchIndex);
+        playVariation(moves);
+      });
+      list.append(branch);
+    });
   });
+}
+
+function saveBranch(index, moves) {
+  if (!moves.length) return;
+  const lines = branches.get(index) || [];
+  const signature = moves.join(" ");
+  if (!lines.some((line) => line.join(" ") === signature))
+    lines.push([...moves]);
+  branches.set(index, lines);
 }
 
 function onDrop(from, to) {
   const move = viewer.move({ from, to, promotion: "q" });
   if (!move) return "snapback";
   variation.push(move);
-  branches.set(
+  saveBranch(
     mainIndex,
     variation.map((item) => item.san),
   );
+  analysisModified = true;
   scheduleAnalysis();
   renderMoveTree();
+}
+
+function activateAnalysisSquare(square) {
+  const piece = viewer.get(square);
+  if (!analysisSelected) {
+    if (piece?.color === viewer.turn()) analysisSelected = square;
+    return;
+  }
+  if (piece?.color === viewer.turn()) {
+    analysisSelected = square;
+    return;
+  }
+  const move = viewer.move({
+    from: analysisSelected,
+    to: square,
+    promotion: "q",
+  });
+  analysisSelected = null;
+  if (!move) return;
+  variation.push(move);
+  saveBranch(
+    mainIndex,
+    variation.map((item) => item.san),
+  );
+  analysisModified = true;
+  board.position(viewer.fen(), true);
+  renderMoveTree();
+  scheduleAnalysis();
+}
+
+function makeAnalysisBoardAccessible(focusSquare = "e2") {
+  const names = {
+    p: "pawn",
+    n: "knight",
+    b: "bishop",
+    r: "rook",
+    q: "queen",
+    k: "king",
+  };
+  document
+    .querySelectorAll("#av-board [class*='square-']")
+    .forEach((element) => {
+      const square = element.className.match(/square-([a-h][1-8])/)?.[1];
+      if (!square) return;
+      const piece = viewer.get(square);
+      element.setAttribute("role", "button");
+      element.tabIndex = square === focusSquare ? 0 : -1;
+      element.onkeydown = analysisBoardKeydown;
+      element.setAttribute(
+        "aria-label",
+        piece
+          ? `${square}, ${piece.color === "w" ? "white" : "black"} ${names[piece.type]}`
+          : `${square}, empty`,
+      );
+    });
+}
+
+function analysisBoardKeydown(event) {
+  event.stopPropagation();
+  const current = event.target.closest('[class*="square-"]');
+  const square = current?.className.match(/square-([a-h][1-8])/)?.[1];
+  if (!square) return;
+  if (["Enter", " "].includes(event.key)) {
+    event.preventDefault();
+    activateAnalysisSquare(square);
+    return;
+  }
+  const delta = {
+    ArrowLeft: [-1, 0],
+    ArrowRight: [1, 0],
+    ArrowUp: [0, 1],
+    ArrowDown: [0, -1],
+  }[event.key];
+  if (!delta) return;
+  event.preventDefault();
+  const file = Math.max(0, Math.min(7, square.charCodeAt(0) - 97 + delta[0]));
+  const rank = Math.max(1, Math.min(8, Number(square[1]) + delta[1]));
+  const next = `${"abcdefgh"[file]}${rank}`;
+  makeAnalysisBoardAccessible(next);
+  document.querySelector(`#av-board .square-${next}`)?.focus();
+}
+
+function analysisBoardClick(event) {
+  const square = event.target
+    .closest('[class*="square-"]')
+    ?.className.match(/square-([a-h][1-8])/)?.[1];
+  if (square) activateAnalysisSquare(square);
 }
 
 function initializeBoard(orientation = "white") {
@@ -188,9 +324,21 @@ function initializeBoard(orientation = "white") {
     draggable: true,
     showNotation: window.chessbotPrefs?.coordinates !== false,
     onDrop,
-    onSnapEnd: () => board.position(viewer.fen()),
+    onSnapEnd: () => {
+      board.position(viewer.fen());
+      makeAnalysisBoardAccessible();
+    },
     pieceTheme: "/static/pieces/{piece}.png",
   });
+  $("av-board").addEventListener("click", analysisBoardClick);
+  $("av-board").addEventListener("keydown", analysisBoardKeydown);
+  boardObserver?.disconnect();
+  boardObserver = new window.MutationObserver(() =>
+    makeAnalysisBoardAccessible(),
+  );
+  boardObserver.observe($("av-board"), { childList: true, subtree: true });
+  makeAnalysisBoardAccessible();
+  setTimeout(makeAnalysisBoardAccessible, 0);
 }
 
 export function openGame(game) {
@@ -201,10 +349,13 @@ export function openGame(game) {
   }
   mainMoves = loader.history({ verbose: true });
   mainIndex = 0;
+  returnIndex = 0;
   variation = [];
   branches.clear();
   evaluations.clear();
   viewer = new Chess();
+  sourcePgn = game.pgn || "";
+  analysisModified = false;
   initializeBoard(game.user_color || "white");
   $("recent-games-panel").hidden = true;
   $("av-game-view").hidden = false;
@@ -229,6 +380,7 @@ function scheduleAnalysis() {
 }
 
 async function analyzePosition() {
+  const generation = ++analysisGeneration;
   $("analysis-progress").hidden = false;
   try {
     const data = await post(
@@ -240,19 +392,16 @@ async function analyzePosition() {
       },
       { key: "analysis-lines", timeout: 10000 },
     );
+    if (generation !== analysisGeneration) return;
     renderLines(data.lines || [], data.depth || 0);
     updateEval(data.eval_cp, data.eval_is_mate, data.eval_mate);
     const previous = evaluations.get(mainIndex - 1);
-    const swing =
-      previous?.cp == null ? 0 : Math.abs(data.eval_cp - previous.cp);
-    const quality =
-      swing >= 250
-        ? "blunder"
-        : swing >= 120
-          ? "mistake"
-          : swing >= 60
-            ? "inaccuracy"
-            : "";
+    const moverWasWhite = mainIndex % 2 === 1;
+    const quality = classifyMoveQuality(
+      previous?.cp,
+      data.eval_cp,
+      moverWasWhite,
+    );
     evaluations.set(mainIndex, {
       cp: data.eval_cp,
       label: data.eval_is_mate
@@ -262,9 +411,9 @@ async function analyzePosition() {
     });
     renderMoveTree();
   } catch (error) {
-    notify(error.message, "error");
+    if (!(error instanceof CancelledRequest)) notify(error.message, "error");
   } finally {
-    $("analysis-progress").hidden = true;
+    if (generation === analysisGeneration) $("analysis-progress").hidden = true;
   }
 }
 
@@ -296,10 +445,11 @@ function playVariation(sanMoves) {
     if (!move) break;
     variation.push(move);
   }
-  branches.set(
+  saveBranch(
     mainIndex,
     variation.map((move) => move.san),
   );
+  analysisModified = true;
   board.position(viewer.fen(), true);
   renderMoveTree();
   scheduleAnalysis();
@@ -331,8 +481,11 @@ function importText(kind) {
         }
         mainMoves = [];
         mainIndex = 0;
+        returnIndex = 0;
         viewer = loaded;
         variation = [];
+        sourcePgn = "";
+        analysisModified = true;
         initializeBoard();
         $("recent-games-panel").hidden = true;
         $("av-game-view").hidden = false;
@@ -393,7 +546,7 @@ export function initAnalysis() {
       );
     }),
   );
-  $("av-return-btn").addEventListener("click", () => resetTo(mainIndex));
+  $("av-return-btn").addEventListener("click", () => resetTo(returnIndex));
   $("av-reset-btn").addEventListener("click", () => {
     branches.clear();
     resetTo(0);
@@ -414,16 +567,17 @@ export function initAnalysis() {
       });
   });
   $("export-pgn-btn").addEventListener("click", () =>
-    download("analysis.pgn", viewer.pgn()),
+    download(
+      "analysis.pgn",
+      !analysisModified && sourcePgn ? sourcePgn : viewer.pgn(),
+    ),
   );
   $("copy-fen-btn").addEventListener("click", async () => {
-    await navigator.clipboard.writeText(viewer.fen());
-    notify("FEN copied.", "success");
+    await copyText(viewer.fen(), "FEN");
   });
   $("share-analysis-btn").addEventListener("click", async () => {
     location.hash = `fen=${encodeURIComponent(viewer.fen())}`;
-    await navigator.clipboard.writeText(location.href);
-    notify("Share link copied.", "success");
+    await copyText(location.href, "Share link");
   });
   $("download-report-btn").addEventListener("click", () =>
     download(
@@ -432,11 +586,46 @@ export function initAnalysis() {
     ),
   );
   if (location.hash.startsWith("#fen=")) {
-    const fen = decodeURIComponent(location.hash.slice(5));
-    setTimeout(() => {
-      $("import-fen-btn").click();
-      $("input-value").value = fen;
-    }, 0);
+    try {
+      const fen = decodeURIComponent(location.hash.slice(5));
+      const loaded = new Chess();
+      if (!loaded.load(fen)) throw new Error("Invalid FEN");
+      mainMoves = [];
+      mainIndex = 0;
+      returnIndex = 0;
+      viewer = loaded;
+      variation = [];
+      sourcePgn = "";
+      analysisModified = true;
+      initializeBoard();
+      $("recent-games-panel").hidden = true;
+      $("av-game-view").hidden = false;
+      $("av-game-title").textContent = "Shared position";
+      renderMoveTree();
+      scheduleAnalysis();
+    } catch {
+      notify("This analysis link contains an invalid position.", "error");
+    }
+  }
+}
+
+async function copyText(value, label) {
+  try {
+    await navigator.clipboard.writeText(value);
+    notify(`${label} copied.`, "success");
+  } catch {
+    const fallback = document.createElement("textarea");
+    fallback.value = value;
+    fallback.setAttribute("aria-hidden", "true");
+    fallback.className = "clipboard-fallback";
+    document.body.append(fallback);
+    fallback.select();
+    const copied = document.execCommand("copy");
+    fallback.remove();
+    notify(
+      copied ? `${label} copied.` : `Unable to copy ${label.toLowerCase()}.`,
+      copied ? "success" : "error",
+    );
   }
 }
 

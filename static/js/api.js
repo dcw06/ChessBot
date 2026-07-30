@@ -9,12 +9,19 @@ export class ApiError extends Error {
   }
 }
 
+export class CancelledRequest extends Error {
+  constructor() {
+    super("Request superseded");
+    this.name = "CancelledRequest";
+  }
+}
+
 export async function api(path, options = {}) {
   const { key, timeout = 15000, retries = 0, ...fetchOptions } = options;
-  if (key && inflight.has(key)) inflight.get(key).abort();
+  if (key && inflight.has(key)) inflight.get(key).abort("superseded");
   const controller = new AbortController();
   if (key) inflight.set(key, controller);
-  const timer = setTimeout(() => controller.abort(), timeout);
+  const timer = setTimeout(() => controller.abort("timeout"), timeout);
   try {
     const response = await fetch(path, {
       credentials: "same-origin",
@@ -39,6 +46,11 @@ export async function api(path, options = {}) {
       );
     return data;
   } catch (error) {
+    if (
+      error.name === "AbortError" &&
+      controller.signal.reason === "superseded"
+    )
+      throw new CancelledRequest();
     if (retries > 0 && !(error instanceof ApiError && error.status < 500)) {
       await new Promise((resolve) =>
         setTimeout(resolve, 500 * 2 ** (options._attempt || 0)),
@@ -71,6 +83,6 @@ export function post(path, data, options = {}) {
 }
 
 export function cancelRequest(key) {
-  inflight.get(key)?.abort();
+  inflight.get(key)?.abort("superseded");
   inflight.delete(key);
 }

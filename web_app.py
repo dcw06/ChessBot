@@ -11,12 +11,10 @@ from collections import defaultdict, deque
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
 load_dotenv()
-import re
 import datetime
 import chess
 import chess.engine
 import chess.pgn
-import requests as _requests
 from flask import Flask, jsonify, request, render_template
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -95,8 +93,9 @@ _shutdown_event = threading.Event()
 _stockfish_probe_lock = threading.Lock()
 _stockfish_probe_at = 0.0
 _stockfish_probe_ok = STOCKFISH_READY
-_games_cache_lock = threading.Lock()
-_games_cache: dict[str, object] = {"expires": 0.0, "data": None}
+LOCAL_GAMES_PATH = Path(os.environ.get("LOCAL_GAMES_PATH", "local_games.json"))
+MAX_SAVED_GAMES = 6
+_saved_games_lock = threading.Lock()
 
 
 def _new_state(
@@ -134,6 +133,8 @@ def _new_state(
         "increment":   float(increment_seconds),
         "snapshots":   [],
         "decision_source": "—",
+        "time_control": tc,
+        "saved": False,
         "last_access": time.monotonic(),
     }
 
@@ -182,6 +183,7 @@ def _request_guards():
     limits = {
         "new_game": (10, 60 * 60),
         "api_games": (20, 60),
+        "api_local_games": (60, 60),
         "api_eval": (30, 60),
         "api_lines": (30, 60),
     }
@@ -208,7 +210,13 @@ def _security_headers(response):
         "object-src 'none'; form-action 'self'",
     )
     if request.path.startswith("/static/"):
-        response.headers.setdefault("Cache-Control", "public, max-age=604800, immutable")
+        fingerprinted = "/chunks/" in request.path or any(
+            segment in request.path for segment in ("/vendor/", "/pieces/")
+        )
+        response.headers["Cache-Control"] = (
+            "public, max-age=604800, immutable"
+            if fingerprinted else "public, max-age=3600, must-revalidate"
+        )
     else:
         response.headers.setdefault("Cache-Control", "no-store")
     return response
@@ -342,6 +350,78 @@ def _opening_name(moves: list[str]) -> str:
     return "Opening phase" if len(moves) < 16 else "Middlegame"
 
 
+def _saved_games() -> list[dict]:
+    try:
+        data = json.loads(LOCAL_GAMES_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return []
+        if len(data) > MAX_SAVED_GAMES:
+            data = data[-MAX_SAVED_GAMES:]
+            temporary = LOCAL_GAMES_PATH.with_suffix(LOCAL_GAMES_PATH.suffix + ".tmp")
+            temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            temporary.replace(LOCAL_GAMES_PATH)
+        return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def _game_pgn(s: dict) -> str:
+    game = chess.pgn.Game()
+    game.headers["Event"] = "Alan Dai local game"
+    game.headers["Date"] = datetime.datetime.now().strftime("%Y.%m.%d")
+    human_white = s["bot_color"] == chess.BLACK
+    game.headers["White"] = "You" if human_white else "Alan Dai"
+    game.headers["Black"] = "Alan Dai" if human_white else "You"
+    result = s.get("result") or "*"
+    game.headers["Result"] = (
+        "1-0" if "you win" in result.lower() and human_white else
+        "0-1" if "you win" in result.lower() else
+        "0-1" if "alan dai wins" in result.lower() and human_white else
+        "1-0" if "alan dai wins" in result.lower() else
+        "1/2-1/2" if "draw" in result.lower() else "*"
+    )
+    board = game.board()
+    node = game
+    for san in s["moves"]:
+        move = board.parse_san(san)
+        node = node.add_variation(move)
+        board.push(move)
+    return str(game)
+
+
+def _persist_finished_game(s: dict) -> None:
+    if not s.get("over") or s.get("saved") or not s.get("moves"):
+        return
+    human_white = s["bot_color"] == chess.BLACK
+    result_text = s.get("result") or "Game finished"
+    lowered = result_text.lower()
+    result = "D" if "draw" in lowered else (
+        "W" if "you win" in lowered or "alan dai flagged" in lowered else "L"
+    )
+    record = {
+        "id": secrets.token_urlsafe(10),
+        "opponent": "Alan Dai",
+        "result": result,
+        "result_text": result_text,
+        "time_class": s.get("time_control", "custom"),
+        "date": datetime.datetime.now().strftime("%b %d"),
+        "saved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "pgn": _game_pgn(s),
+        "opening": _opening_name(s["moves"]),
+        "user_color": "white" if human_white else "black",
+        "source": "local",
+    }
+    with _saved_games_lock:
+        records = _saved_games()
+        records.append(record)
+        records = records[-MAX_SAVED_GAMES:]
+        LOCAL_GAMES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = LOCAL_GAMES_PATH.with_suffix(LOCAL_GAMES_PATH.suffix + ".tmp")
+        temporary.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        temporary.replace(LOCAL_GAMES_PATH)
+    s["saved"] = True
+
+
 def _save_snapshot(s: dict):
     snapshots = s.setdefault("snapshots", [])
     snapshots.append({
@@ -389,6 +469,7 @@ def _check_game_over(s: dict):
     if s["human_clock"] <= 0:
         s["over"] = True
         s["result"] = "You flagged — Alan Dai wins on time!"
+    _persist_finished_game(s)
 
 
 # ── Analysis Stockfish (separate from the game engine) ────────────────────
@@ -418,68 +499,17 @@ def _discard_analysis_sf():
 
 @app.route("/api/games")
 def api_games():
-    """Fetch the 20 most recent chess.com games for the username."""
-    hdrs = {"User-Agent": "ChessBot/1.0"}
-    with _games_cache_lock:
-        if _games_cache["data"] is not None and time.monotonic() < _games_cache["expires"]:
-            return jsonify({"games": _games_cache["data"], "cached": True})
-    try:
-        archives_response = _requests.get(
-            f"https://api.chess.com/pub/player/{USERNAME}/games/archives",
-            headers=hdrs, timeout=10,
-        )
-        archives_response.raise_for_status()
-        archives = archives_response.json().get("archives", [])
-        if not archives:
-            return jsonify({"games": []})
+    """Backward-compatible alias for local user-vs-bot history."""
+    with _saved_games_lock:
+        games = list(reversed(_saved_games()))
+    return jsonify({"games": games})
 
-        # Collect games from most-recent months until we have 20
-        collected = []
-        for url in list(reversed(archives))[:6]:
-            response = _requests.get(url, headers=hdrs, timeout=15)
-            response.raise_for_status()
-            month = response.json().get("games", [])
-            collected = month + collected
-            if len(collected) >= 20:
-                break
-        collected = collected[-20:][::-1]   # newest first
-
-        _WIN  = {"win"}
-        _LOSS = {"lose", "resigned", "timeout", "checkmated", "abandoned"}
-
-        result = []
-        for g in collected:
-            white, black = g.get("white", {}), g.get("black", {})
-            is_white = white.get("username", "").lower() == USERNAME.lower()
-            if is_white:
-                opponent, opp_rating, my_result = black.get("username","?"), black.get("rating","?"), white.get("result","?")
-            else:
-                opponent, opp_rating, my_result = white.get("username","?"), white.get("rating","?"), black.get("result","?")
-
-            pgn_text = g.get("pgn", "")
-            eco_m    = re.search(r'\[ECOUrl "([^"]+)"\]', pgn_text)
-            opening  = eco_m.group(1).split("/")[-1].replace("-", " ").title()[:42] if eco_m else "Unknown"
-
-            result_char = "W" if my_result in _WIN else ("L" if my_result in _LOSS else "D")
-            date_str    = datetime.datetime.fromtimestamp(g.get("end_time", 0)).strftime("%b %d")
-
-            result.append({
-                "url":        g.get("url", ""),
-                "opponent":   opponent,
-                "opp_rating": opp_rating,
-                "result":     result_char,
-                "time_class": g.get("time_class", ""),
-                "date":       date_str,
-                "pgn":        pgn_text,
-                "opening":    opening,
-                "user_color": "white" if is_white else "black",
-            })
-        with _games_cache_lock:
-            _games_cache.update(data=result, expires=time.monotonic() + 300)
-        return jsonify({"games": result, "cached": False})
-    except Exception:
-        logger.exception("Unable to fetch recent games")
-        return jsonify({"error": "Unable to fetch recent games."}), 502
+@app.route("/api/local-games")
+def api_local_games():
+    """Return the six most recently completed browser-vs-bot games."""
+    with _saved_games_lock:
+        games = list(reversed(_saved_games()))
+    return jsonify({"games": games})
 
 
 @app.route("/api/eval", methods=["POST"])
@@ -624,7 +654,9 @@ def new_game():
     if old_game is not None:
         with old_game["lock"]:
             old_game["over"] = True
+            old_game["result"] = old_game.get("result") or "Game replaced."
             old_game["version"] += 1
+            _persist_finished_game(old_game)
             old_game["engine"].close()
 
     response = jsonify(_board_json(s))
@@ -647,6 +679,7 @@ def resign():
         s["over"] = True
         s["result"] = "You resigned — Alan Dai wins!"
         s["version"] += 1
+        _persist_finished_game(s)
         return jsonify(_board_json(s))
 
 
@@ -664,6 +697,7 @@ def abort():
         s["over"] = True
         s["result"] = "Game aborted."
         s["version"] += 1
+        _persist_finished_game(s)
         return jsonify(_board_json(s))
 
 

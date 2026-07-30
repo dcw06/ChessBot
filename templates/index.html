@@ -73,11 +73,18 @@
       </div>
     </header>
 
-    <nav id="main-nav" class="tabs" aria-label="Application sections">
+    <nav
+      id="main-nav"
+      class="tabs"
+      role="tablist"
+      aria-label="Application sections"
+    >
       <button
         class="nav-tab active"
         id="tab-play"
         data-tab="play"
+        role="tab"
+        aria-controls="play-section"
         aria-selected="true"
       >
         Play
@@ -86,6 +93,9 @@
         class="nav-tab"
         id="tab-analyze"
         data-tab="analyze"
+        role="tab"
+        aria-controls="analyze-section"
+        tabindex="-1"
         aria-selected="false"
       >
         Analyze
@@ -93,7 +103,7 @@
     </nav>
 
     <main id="main-content">
-      <section id="play-section" aria-labelledby="tab-play">
+      <section id="play-section" role="tabpanel" aria-labelledby="tab-play">
         <div id="setup-panel" class="card setup-card">
           <div class="setup-heading">
             <p class="eyebrow">New game</p>
@@ -102,16 +112,32 @@
           <fieldset>
             <legend>Time control</legend>
             <div class="segmented-control">
-              <button class="choice-button tc-btn" data-tc="bullet">
+              <button
+                class="choice-button tc-btn"
+                data-tc="bullet"
+                aria-pressed="false"
+              >
                 1 min<span>Bullet</span>
               </button>
-              <button class="choice-button tc-btn selected" data-tc="blitz">
+              <button
+                class="choice-button tc-btn selected"
+                data-tc="blitz"
+                aria-pressed="true"
+              >
                 3 min<span>Blitz</span>
               </button>
-              <button class="choice-button tc-btn" data-tc="rapid">
+              <button
+                class="choice-button tc-btn"
+                data-tc="rapid"
+                aria-pressed="false"
+              >
                 10 min<span>Rapid</span>
               </button>
-              <button class="choice-button tc-btn" data-tc="custom">
+              <button
+                class="choice-button tc-btn"
+                data-tc="custom"
+                aria-pressed="false"
+              >
                 Custom<span>Clock</span>
               </button>
             </div>
@@ -143,10 +169,15 @@
               <button
                 class="choice-button color-btn selected"
                 data-color="white"
+                aria-pressed="true"
               >
                 <span class="piece-symbol">♙</span>White
               </button>
-              <button class="choice-button color-btn" data-color="black">
+              <button
+                class="choice-button color-btn"
+                data-color="black"
+                aria-pressed="false"
+              >
                 <span class="piece-symbol">♟</span>Black
               </button>
             </div>
@@ -183,12 +214,11 @@
                 <span id="live-eval-label">0.0</span>
               </div>
               <div id="board-wrap">
-                <div id="board" aria-label="Interactive chess board"></div>
-              </div>
-              <div id="board-loader" class="board-loader" hidden>
-                <span class="spinner"></span
-                ><strong>Alan Dai is thinking</strong
-                ><small id="thinking-detail">Evaluating the position…</small>
+                <div
+                  id="board"
+                  role="group"
+                  aria-label="Interactive chess board"
+                ></div>
               </div>
             </div>
             <div class="player-strip strip-bottom" id="bottom-strip">
@@ -246,7 +276,12 @@
         </div>
       </section>
 
-      <section id="analyze-section" aria-labelledby="tab-analyze" hidden>
+      <section
+        id="analyze-section"
+        role="tabpanel"
+        aria-labelledby="tab-analyze"
+        hidden
+      >
         <div class="analysis-toolbar card">
           <div class="toolbar-row">
             <button id="import-pgn-btn" class="button secondary">
@@ -298,13 +333,13 @@
         <div id="recent-games-panel" class="card recent-games-panel">
           <div class="section-heading">
             <div>
-              <p class="eyebrow">Chess.com</p>
-              <h2>Recent games</h2>
+              <p class="eyebrow">You versus Alan Dai</p>
+              <h2>Saved games</h2>
             </div>
             <button
               id="refresh-games-btn"
               class="icon-button"
-              aria-label="Refresh recent games"
+              aria-label="Refresh saved games"
             >
               ↻
             </button>
@@ -361,7 +396,11 @@
               </div>
             </div>
             <div id="av-board-wrap">
-              <div id="av-board" aria-label="Analysis chess board"></div>
+              <div
+                id="av-board"
+                role="group"
+                aria-label="Analysis chess board"
+              ></div>
             </div>
             <div class="player-strip strip-bottom">
               <div class="player-avatar" id="av-bottom-avatar">♙</div>
@@ -427,7 +466,7 @@
     ></div>
     <div id="sr-announcer" class="sr-only" aria-live="assertive"></div>
 
-    <dialog id="confirm-dialog">
+    <dialog id="confirm-dialog" aria-labelledby="confirm-title">
       <form method="dialog">
         <h2 id="confirm-title">Are you sure?</h2>
         <p id="confirm-message"></p>
@@ -439,9 +478,9 @@
         </div>
       </form>
     </dialog>
-    <dialog id="promotion-dialog">
+    <dialog id="promotion-dialog" aria-labelledby="promotion-title">
       <form method="dialog">
-        <h2>Choose promotion</h2>
+        <h2 id="promotion-title">Choose promotion</h2>
         <div class="promotion-options">
           <button value="q" aria-label="Promote to queen">♛</button
           ><button value="r" aria-label="Promote to rook">♜</button
@@ -451,7 +490,7 @@
         <button value="cancel" class="button secondary">Cancel</button>
       </form>
     </dialog>
-    <dialog id="result-dialog">
+    <dialog id="result-dialog" aria-labelledby="result-title">
       <form method="dialog">
         <div id="result-icon" class="result-icon">♟</div>
         <h2 id="result-title">Game over</h2>
@@ -459,14 +498,21 @@
         <div class="dialog-actions">
           <button value="close" class="button secondary">Close</button
           ><button id="result-rematch" value="rematch" class="button primary">
-            Play again
+            Play again</button
+          ><button
+            id="result-switch-color"
+            value="switch"
+            class="button secondary"
+          >
+            Switch colors
           </button>
         </div>
       </form>
     </dialog>
-    <dialog id="input-dialog">
+    <dialog id="input-dialog" aria-labelledby="input-title">
       <form method="dialog">
         <h2 id="input-title">Import</h2>
+        <label for="input-value" class="sr-only">PGN or FEN text</label>
         <textarea id="input-value" rows="8"></textarea>
         <div class="dialog-actions">
           <button value="cancel" class="button secondary">Cancel</button
@@ -474,9 +520,9 @@
         </div>
       </form>
     </dialog>
-    <dialog id="settings-dialog">
+    <dialog id="settings-dialog" aria-labelledby="settings-title">
       <form method="dialog">
-        <h2>Display settings</h2>
+        <h2 id="settings-title">Display settings</h2>
         <label
           >Board theme<select id="board-theme">
             <option value="classic">Classic</option>
@@ -504,6 +550,6 @@
     <script src="/static/vendor/jquery-3.7.1.min.js"></script>
     <script src="/static/vendor/chessboard-1.0.0.min.js"></script>
     <script src="/static/vendor/chess-0.10.3.min.js"></script>
-    <script src="/static/dist/app.min.js" defer></script>
+    <script src="/static/dist/app.min.js" type="module"></script>
   </body>
 </html>

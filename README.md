@@ -53,6 +53,10 @@ The browser suite covers desktop and mobile layouts, keyboard access, game
 startup, promotion choice, overflow, and visual regression. Rebuild the
 production assets after changing frontend source.
 
+Completed browser games against Alan Dai are stored in `local_games.json` for
+review in the Analyze tab. Only the six newest games are retained; Chess.com
+history is not fetched or displayed.
+
 `/health/live` checks the HTTP process. `/health/ready` verifies that the ONNX
 model loaded at startup and reports whether the Stockfish startup probe passed.
 

@@ -1,5 +1,10 @@
 let context;
-let enabled = localStorage.getItem("chessbot:sound") !== "off";
+let enabled = true;
+try {
+  enabled = localStorage.getItem("chessbot:sound") !== "off";
+} catch {
+  /* Sound remains enabled. */
+}
 
 const notes = {
   move: [420, 0.045],
@@ -15,7 +20,11 @@ export function soundEnabled() {
 }
 export function setSoundEnabled(value) {
   enabled = Boolean(value);
-  localStorage.setItem("chessbot:sound", enabled ? "on" : "off");
+  try {
+    localStorage.setItem("chessbot:sound", enabled ? "on" : "off");
+  } catch {
+    /* Preference remains in memory. */
+  }
 }
 
 export function playSound(kind = "move") {

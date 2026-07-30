@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   classifyResult,
+  classifyMoveQuality,
   evaluationPercent,
   formatClock,
 } from "../../static/js/chess-utils.js";
@@ -10,6 +11,13 @@ test("formats clocks without showing negative time", () => {
   assert.equal(formatClock(180), "3:00");
   assert.equal(formatClock(9.9), "0:09");
   assert.equal(formatClock(-4), "0:00");
+});
+
+test("move quality only penalizes evaluation lost by the mover", () => {
+  assert.equal(classifyMoveQuality(0, -300, true), "blunder");
+  assert.equal(classifyMoveQuality(0, 300, true), "");
+  assert.equal(classifyMoveQuality(0, 150, false), "mistake");
+  assert.equal(classifyMoveQuality(0, -150, false), "");
 });
 
 test("classifies distinct game results", () => {
