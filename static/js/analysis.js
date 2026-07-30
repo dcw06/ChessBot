@@ -339,6 +339,7 @@ function initializeBoard(orientation = "white") {
   boardObserver.observe($("av-board"), { childList: true, subtree: true });
   makeAnalysisBoardAccessible();
   setTimeout(makeAnalysisBoardAccessible, 0);
+  window.requestAnimationFrame(() => board?.resize());
 }
 
 export function openGame(game) {
@@ -356,9 +357,9 @@ export function openGame(game) {
   viewer = new Chess();
   sourcePgn = game.pgn || "";
   analysisModified = false;
-  initializeBoard(game.user_color || "white");
   $("recent-games-panel").hidden = true;
   $("av-game-view").hidden = false;
+  initializeBoard(game.user_color || "white");
   $("av-game-title").textContent =
     `${game.result || "Analysis"} · ${game.opponent || "Imported game"} · ${game.opening || ""}`;
   const userBlack = game.user_color === "black";
@@ -486,9 +487,9 @@ function importText(kind) {
         variation = [];
         sourcePgn = "";
         analysisModified = true;
-        initializeBoard();
         $("recent-games-panel").hidden = true;
         $("av-game-view").hidden = false;
+        initializeBoard();
         $("av-game-title").textContent = "Custom position";
         renderMoveTree();
         scheduleAnalysis();
@@ -597,9 +598,9 @@ export function initAnalysis() {
       variation = [];
       sourcePgn = "";
       analysisModified = true;
-      initializeBoard();
       $("recent-games-panel").hidden = true;
       $("av-game-view").hidden = false;
+      initializeBoard();
       $("av-game-title").textContent = "Shared position";
       renderMoveTree();
       scheduleAnalysis();

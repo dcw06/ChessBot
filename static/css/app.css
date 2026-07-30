@@ -382,6 +382,9 @@ kbd {
 .analysis-board-column {
   min-width: 0;
 }
+.view-return-row {
+  margin-bottom: 0.55rem;
+}
 .board-shell {
   position: relative;
   display: flex;

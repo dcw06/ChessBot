@@ -160,7 +160,10 @@ async function makeMove(from, to) {
   let promotion = "q";
   if (piece?.type === "p" && ["1", "8"].includes(to[1])) {
     promotion = await choosePromotion();
-    if (!promotion) return false;
+    if (!promotion) {
+      board.position(game.fen(), false);
+      return false;
+    }
   }
   const move = game.move({ from, to, promotion });
   if (!move) return false;
@@ -201,8 +204,12 @@ function onDragStart(source, piece) {
 }
 function onDrop(from, to) {
   clearLegalMoves();
-  makeMove(from, to);
-  return "snapback";
+  const candidate = game.move({ from, to, promotion: "q" });
+  if (!candidate) return "snapback";
+  game.undo();
+  clearSelection();
+  window.queueMicrotask(() => makeMove(from, to));
+  return undefined;
 }
 function onSnapEnd() {
   board.position(game.fen(), false);
@@ -743,6 +750,21 @@ async function switchTab(tab) {
   resizeBoards();
 }
 
+async function returnToSetup() {
+  if (
+    !gameOver &&
+    !(await confirmAction(
+      "Return to setup?",
+      "This game will remain active until you start a replacement game.",
+      "Return",
+    ))
+  )
+    return;
+  $("game-panel").hidden = true;
+  $("setup-panel").hidden = false;
+  stopPolling();
+}
+
 function resizeBoards() {
   board?.resize();
   window.dispatchEvent(new CustomEvent("chessbot:resize-analysis"));
@@ -797,6 +819,8 @@ function bindEvents() {
     }),
   );
   $("start-btn").addEventListener("click", () => startGame());
+  $("game-return-btn").addEventListener("click", returnToSetup);
+  $("analysis-return-btn").addEventListener("click", () => switchTab("play"));
   $("retry-btn").addEventListener("click", () => {
     refreshHealth();
     syncState();
