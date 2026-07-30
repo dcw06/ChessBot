@@ -1,0 +1,8 @@
+# Human-edited runtime dependency inputs. Production uses the exact lock file.
+python-chess==1.999
+onnxruntime==1.27.0
+requests==2.34.2
+numpy==2.4.6
+flask==3.1.3
+gunicorn==26.0.0
+python-dotenv==1.2.2

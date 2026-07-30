@@ -1,0 +1,13 @@
+.git
+.env
+__pycache__
+*.pyc
+*.pt
+*.onnx.data
+*.pgn
+pgns/
+tests/
+ChessBot_v1_drew_3200/
+local_games.json
+analyze_style*.py
+*_analysis.py

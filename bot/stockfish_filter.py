@@ -1,7 +1,9 @@
 import chess
 import chess.engine
+import logging
 from typing import Optional, List
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_TIME_LIMIT = 0.02  # 20ms — shallower search, misses subtle tactics like a human would
 
@@ -54,10 +56,38 @@ class StockfishFilter:
         threshold_cp: int = 150,
         time_limit: float = DEFAULT_TIME_LIMIT,
     ):
+        self.stockfish_path = stockfish_path
         self.threshold_cp = threshold_cp
         self.time_limit   = time_limit
-        self._engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+        self.last_error: Optional[str] = None
+        self._engine = None
+        self._start()
+
+    def _start(self):
+        self._engine = chess.engine.SimpleEngine.popen_uci(self.stockfish_path)
         self._engine.configure({"Threads": 1, "Hash": 4})
+        self.last_error = None
+
+    def restart(self) -> bool:
+        self.close()
+        try:
+            self._start()
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            logger.exception("Failed to restart Stockfish")
+            return False
+
+    def is_healthy(self) -> bool:
+        if self._engine is None:
+            return False
+        try:
+            self._engine.ping()
+            self.last_error = None
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
 
     # ------------------------------------------------------------------
 
@@ -73,7 +103,10 @@ class StockfishFilter:
                 chess.engine.Limit(time=self.time_limit),
                 multipv=5,
             )
-        except Exception:
+        except Exception as exc:
+            self.last_error = str(exc)
+            logger.exception("Stockfish analysis failed; attempting restart")
+            self.restart()
             return None
 
         if not result:
@@ -154,7 +187,10 @@ class StockfishFilter:
     # ------------------------------------------------------------------
 
     def close(self):
+        engine, self._engine = self._engine, None
+        if engine is None:
+            return
         try:
-            self._engine.quit()
+            engine.quit()
         except Exception:
-            pass
+            logger.exception("Failed to close Stockfish cleanly")

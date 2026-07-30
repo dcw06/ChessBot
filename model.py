@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+from bot.model_contract import NUM_ACTIONS, NUM_PLANES
 
 class ResBlock(nn.Module):
     def __init__(self, channels: int):
@@ -19,7 +20,7 @@ class ResBlock(nn.Module):
 
 
 class ChessNet(nn.Module):
-    def __init__(self, in_channels: int = 21, channels: int = 128, num_res_blocks: int = 6, num_actions: int = 4288):
+    def __init__(self, in_channels: int = NUM_PLANES, channels: int = 128, num_res_blocks: int = 6, num_actions: int = NUM_ACTIONS):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, channels, 3, padding=1, bias=False),

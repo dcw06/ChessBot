@@ -1,4 +1,5 @@
 import chess
+import logging
 import random
 import shutil
 import numpy as np
@@ -12,7 +13,16 @@ from .time_pressure import TimePressureHandler
 from .tactics import find_rescue_move, find_pawn_rescue, find_recapture, find_winning_capture, find_tactical_move, find_strategic_move
 from .stockfish_filter import StockfishFilter
 from . import tactic_weights
+from .model_contract import (
+    INPUT_NAME,
+    NUM_ACTIONS,
+    NUM_PLANES,
+    POLICY_OUTPUT_NAME,
+    VALUE_OUTPUT_NAME,
+    validate_manifest,
+)
 
+logger = logging.getLogger(__name__)
 
 
 
@@ -20,6 +30,56 @@ _MATERIAL_VALUE = {
     chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
     chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0,
 }
+
+
+def load_model(
+    model_path: str,
+    manifest_path: str | None = None,
+    expected_username: str | None = None,
+):
+    """Load the deployment model and verify the serving contract."""
+    manifest = validate_manifest(model_path, manifest_path, expected_username)
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = 1
+    opts.inter_op_num_threads = 1
+    session = ort.InferenceSession(
+        model_path, sess_options=opts, providers=["CPUExecutionProvider"]
+    )
+    inputs = session.get_inputs()
+    outputs = session.get_outputs()
+    if len(inputs) != 1 or inputs[0].name != INPUT_NAME:
+        raise ValueError(f"ONNX model must expose one input named {INPUT_NAME!r}")
+    if len(outputs) != 2:
+        raise ValueError("ONNX model must expose policy and value outputs")
+    input_shape = inputs[0].shape
+    if list(input_shape[1:]) != [NUM_PLANES, 8, 8]:
+        raise ValueError(f"Unexpected ONNX input shape: {input_shape}")
+    manifest_actions = manifest["num_actions"]
+    if outputs[0].name != POLICY_OUTPUT_NAME or outputs[0].shape[-1] != manifest_actions:
+        raise ValueError(
+            f"Unexpected ONNX policy output: {outputs[0].name} {outputs[0].shape}"
+        )
+    if outputs[1].name != VALUE_OUTPUT_NAME or outputs[1].shape[-1] != 1:
+        raise ValueError(
+            f"Unexpected ONNX value output: {outputs[1].name} {outputs[1].shape}"
+        )
+    contract = {
+        "input": inputs[0].name,
+        "input_shape": input_shape,
+        "outputs": [output.name for output in outputs],
+        "manifest": manifest,
+    }
+    return session, contract
+
+
+def validate_model(
+    model_path: str,
+    manifest_path: str | None = None,
+    expected_username: str | None = None,
+) -> dict:
+    _, contract = load_model(model_path, manifest_path, expected_username)
+    return contract
+
 
 def _material_diff(board: chess.Board) -> int:
     """Absolute material difference in pawn units (always ≥ 0)."""
@@ -86,14 +146,20 @@ class ChessBotEngine:
         opening_book_path: str = "opening_book.json",
         device: Optional[str] = None,
         stockfish_path: str = "",
+        inference_session=None,
+        model_manifest_path: str = "",
     ):
         self.device = "cpu"
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 1
-        opts.inter_op_num_threads = 1
-        self.session = ort.InferenceSession(
-            model_path, sess_options=opts, providers=["CPUExecutionProvider"]
-        )
+        self.session = inference_session
+        loaded_contract = None
+        if self.session is None:
+            self.session, loaded_contract = load_model(
+                model_path,
+                model_manifest_path or None,
+                expected_username=username,
+            )
+        output_actions = self.session.get_outputs()[0].shape[-1]
+        self.action_encoding_version = 1 if output_actions == 4288 else 2
 
         self.time_manager = TimeManager(time_control)
         self.opening_book = OpeningBook(opening_book_path, username)
@@ -106,12 +172,28 @@ class ChessBotEngine:
         resolved = stockfish_path or shutil.which("stockfish") or "/usr/games/stockfish"
         try:
             self.stockfish = StockfishFilter(resolved, threshold_cp=400)
-            print(f"[ChessBotEngine] Stockfish enabled (threshold=450cp, time=20ms)")
+            print(f"[ChessBotEngine] Stockfish enabled (threshold=400cp, time=20ms)")
+        except FileNotFoundError as exc:
+            self.stockfish = None
+            logger.warning("Stockfish not found; safety filter disabled: %s", exc)
         except Exception:
             self.stockfish = None
-            print(f"[ChessBotEngine] Stockfish not found — obvious-move filter disabled")
+            logger.exception("Stockfish failed to start; safety filter disabled")
 
         print(f"[ChessBotEngine] time_control={time_control}  device={self.device}")
+
+    def health(self) -> dict:
+        return {
+            "model": True,
+            "stockfish": self.stockfish is not None and self.stockfish.is_healthy(),
+            "stockfish_error": (
+                self.stockfish.last_error if self.stockfish is not None else "unavailable"
+            ),
+        }
+
+    def close(self):
+        if self.stockfish is not None:
+            self.stockfish.close()
 
     # ------------------------------------------------------------------
     # Public API
@@ -275,9 +357,13 @@ class ChessBotEngine:
                 legal_moves = filtered
 
         if canonical_flip:
-            indices = np.array([flip_move(m) for m in legal_moves])
+            indices = np.array([
+                flip_move(m, version=self.action_encoding_version) for m in legal_moves
+            ])
         else:
-            indices = np.array([move_to_index(m) for m in legal_moves])
+            indices = np.array([
+                move_to_index(m, version=self.action_encoding_version) for m in legal_moves
+            ])
         legal_logits = logits[indices]
 
         # Softmax with temperature

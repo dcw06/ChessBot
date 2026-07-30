@@ -119,9 +119,9 @@ class OpeningBook:
 
                 white = game.headers.get("White", "").lower()
                 black = game.headers.get("Black", "").lower()
-                if username in white:
+                if username == white:
                     user_color = chess.WHITE
-                elif username in black:
+                elif username == black:
                     user_color = chess.BLACK
                 else:
                     continue

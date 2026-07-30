@@ -3,6 +3,12 @@ import os
 import shutil
 import time
 import threading
+import atexit
+import logging
+import secrets
+from pathlib import Path
+from collections import defaultdict, deque
+from urllib.parse import urlsplit
 from dotenv import load_dotenv
 load_dotenv()
 import re
@@ -12,14 +18,27 @@ import chess.engine
 import chess.pgn
 import requests as _requests
 from flask import Flask, jsonify, request, render_template_string
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-from bot.engine import ChessBotEngine
+from bot.engine import ChessBotEngine, load_model
 from bot.think_timer import ThinkTimer
+from bot.model_contract import resolve_release_paths
 
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
+if os.environ.get("TRUST_PROXY_HEADERS", "0") == "1":
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 USERNAME         = os.environ.get("CHESS_USERNAME", os.environ.get("USERNAME", "yuandan"))
 MODEL_PATH       = os.environ.get("MODEL_PATH",       "best_model.onnx")
+# Older local .env files pointed serving at the PyTorch checkpoint. Serving only
+# accepts ONNX, so recover to the documented deployment artifact automatically.
+if Path(MODEL_PATH).suffix == ".pt":
+    logger.warning("Ignoring legacy MODEL_PATH=%s; using best_model.onnx", MODEL_PATH)
+    MODEL_PATH = "best_model.onnx"
+MANIFEST_PATH    = os.environ.get("MODEL_MANIFEST_PATH", "best_model.manifest.json")
+RELEASE_PATH     = os.environ.get("MODEL_RELEASE_PATH", "best_model.release.json")
 BOOK_PATH        = os.environ.get("BOOK_PATH",        "opening_book.json")
 _sf_env = os.environ.get("STOCKFISH_PATH", "")
 STOCKFISH_PATH   = (
@@ -27,16 +46,55 @@ STOCKFISH_PATH   = (
     else shutil.which("stockfish") or "/usr/games/stockfish"
 )
 
+try:
+    MODEL_PATH, MANIFEST_PATH = map(
+        str, resolve_release_paths(MODEL_PATH, MANIFEST_PATH, RELEASE_PATH)
+    )
+    MODEL_SESSION, MODEL_CONTRACT = load_model(
+        MODEL_PATH, MANIFEST_PATH, expected_username=USERNAME
+    )
+    MODEL_ERROR = None
+except Exception as exc:
+    MODEL_SESSION = None
+    MODEL_CONTRACT = None
+    MODEL_ERROR = str(exc)
+    logger.exception("Deployment model failed startup validation")
+
+try:
+    _startup_sf = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+    _startup_sf.ping()
+    _startup_sf.quit()
+    STOCKFISH_READY = True
+    STOCKFISH_ERROR = None
+except Exception as exc:
+    STOCKFISH_READY = False
+    STOCKFISH_ERROR = str(exc)
+    logger.warning("Stockfish failed startup validation: %s", exc)
+
 TIME_CONTROLS = {
     "bullet": 60,
     "blitz":  180,
     "rapid":  600,
 }
 
-# Single shared game state (one game at a time)
-_lock          = threading.Lock()
+# Isolated in-memory games. The opaque token is stored in an HttpOnly cookie and
+# never accepted from request JSON, preventing one client from selecting another
+# client's game.
+GAME_COOKIE    = "chessbot_game"
+MAX_ACTIVE_GAMES = int(os.environ.get("MAX_ACTIVE_GAMES", "8"))
+GAME_IDLE_TTL = int(os.environ.get("GAME_IDLE_TTL", str(24 * 60 * 60)))
+FINISHED_GAME_TTL = int(os.environ.get("FINISHED_GAME_TTL", str(15 * 60)))
+_games_lock    = threading.Lock()
 _analysis_lock = threading.Lock()
-state: dict    = {}
+_games: dict[str, dict] = {}
+_reserved_games = 0
+_creating_tokens: set[str] = set()
+_rate_lock = threading.Lock()
+_rate_events: dict[tuple[str, str], deque] = defaultdict(deque)
+_shutdown_event = threading.Event()
+_stockfish_probe_lock = threading.Lock()
+_stockfish_probe_at = 0.0
+_stockfish_probe_ok = STOCKFISH_READY
 
 
 def _new_state(tc: str, bot_color: str) -> dict:
@@ -47,9 +105,11 @@ def _new_state(tc: str, bot_color: str) -> dict:
         username=USERNAME,
         opening_book_path=BOOK_PATH,
         stockfish_path=STOCKFISH_PATH,
+        inference_session=MODEL_SESSION,
     )
     total = float(TIME_CONTROLS[tc])
     return {
+        "lock":        threading.RLock(),
         "engine":      engine,
         "think_timer": ThinkTimer(tc),
         "board":       chess.Board(),
@@ -62,7 +122,159 @@ def _new_state(tc: str, bot_color: str) -> dict:
         "is_rematch":  False,
         "moves":       [],          # list of SAN strings
         "last_move":   None,        # (from_sq, to_sq) for highlighting
+        "version":     0,
+        "bot_busy":    False,
+        "last_access": time.monotonic(),
     }
+
+
+def _request_data() -> dict:
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def _same_origin() -> bool:
+    origin = request.headers.get("Origin")
+    if not origin:
+        return True
+    supplied = urlsplit(origin)
+    expected = urlsplit(request.host_url)
+    return (
+        supplied.scheme == expected.scheme
+        and supplied.netloc.lower() == expected.netloc.lower()
+    )
+
+
+def _rate_allowed(bucket: str, limit: int, window_seconds: float) -> bool:
+    now = time.monotonic()
+    key = (bucket, request.remote_addr or "unknown")
+    with _rate_lock:
+        events = _rate_events[key]
+        while events and now - events[0] >= window_seconds:
+            events.popleft()
+        if len(events) >= limit:
+            return False
+        events.append(now)
+        return True
+
+
+@app.before_request
+def _request_guards():
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not _same_origin():
+        return jsonify({"error": "Cross-origin request rejected."}), 403
+    limits = {
+        "new_game": (10, 60 * 60),
+        "api_eval": (30, 60),
+        "api_lines": (30, 60),
+    }
+    rule = limits.get(request.endpoint)
+    if rule and not _rate_allowed(request.endpoint, *rule):
+        return jsonify({"error": "Rate limit exceeded."}), 429
+
+
+@app.after_request
+def _security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault(
+        "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
+    )
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; frame-ancestors 'none'; base-uri 'self'",
+    )
+    return response
+
+
+def _current_game():
+    token = request.cookies.get(GAME_COOKIE, "")
+    if not token:
+        return None, None
+    with _games_lock:
+        game = _games.get(token)
+        if game is not None:
+            game["last_access"] = time.monotonic()
+        return token, game
+
+
+def _game_or_error():
+    token, game = _current_game()
+    if game is None:
+        return token, None, (jsonify({"error": "No game in progress."}), 404)
+    return token, game, None
+
+
+def _prune_games():
+    """Remove abandoned games and return them for cleanup outside the store lock."""
+    now = time.monotonic()
+    removed = []
+    with _games_lock:
+        for token, game in list(_games.items()):
+            ttl = FINISHED_GAME_TTL if game["over"] else GAME_IDLE_TTL
+            if now - game["last_access"] > ttl:
+                removed.append(_games.pop(token))
+        if len(_games) >= MAX_ACTIVE_GAMES:
+            finished = [
+                (token, game) for token, game in _games.items() if game["over"]
+            ]
+            if finished:
+                token, _ = min(finished, key=lambda item: item[1]["last_access"])
+                removed.append(_games.pop(token))
+    for game in removed:
+        with game["lock"]:
+            game["version"] += 1
+            game["engine"].close()
+
+
+def _reaper():
+    while not _shutdown_event.wait(60):
+        try:
+            _prune_games()
+        except Exception:
+            logger.exception("Game reaper failed")
+
+
+_reaper_thread = threading.Thread(
+    target=_reaper, name="chessbot-game-reaper", daemon=True
+)
+_reaper_thread.start()
+
+
+def _stockfish_is_ready() -> bool:
+    global _stockfish_probe_at, _stockfish_probe_ok
+    now = time.monotonic()
+    with _stockfish_probe_lock:
+        if now - _stockfish_probe_at < 10:
+            return _stockfish_probe_ok
+        engine = None
+        try:
+            engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+            engine.ping()
+            _stockfish_probe_ok = True
+        except Exception as exc:
+            logger.warning("Stockfish readiness probe failed: %s", exc)
+            _stockfish_probe_ok = False
+        finally:
+            if engine is not None:
+                try:
+                    engine.quit()
+                except Exception:
+                    logger.exception("Stockfish readiness probe cleanup failed")
+        _stockfish_probe_at = now
+        return _stockfish_probe_ok
+
+
+def _version_matches(s: dict, data: dict) -> bool:
+    expected = data.get("expected_version")
+    return expected is None or (
+        isinstance(expected, int) and not isinstance(expected, bool)
+        and expected == s["version"]
+    )
 
 
 def _board_json(s: dict) -> dict:
@@ -78,6 +290,8 @@ def _board_json(s: dict) -> dict:
         "moves":       s["moves"],
         "last_move":   s["last_move"],
         "in_check":    board.is_check(),
+        "version":     s["version"],
+        "bot_busy":    s["bot_busy"],
     }
 
 
@@ -128,8 +342,19 @@ def _get_analysis_sf():
             _analysis_sf = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
             _analysis_sf.configure({"Threads": 1, "Hash": 64})
         except Exception:
-            pass
+            logger.exception("Analysis Stockfish failed to start")
+            _analysis_sf = None
     return _analysis_sf
+
+
+def _discard_analysis_sf():
+    global _analysis_sf
+    engine, _analysis_sf = _analysis_sf, None
+    if engine is not None:
+        try:
+            engine.quit()
+        except Exception:
+            logger.exception("Failed to discard analysis Stockfish")
 
 
 @app.route("/api/games")
@@ -184,14 +409,15 @@ def api_games():
                 "user_color": "white" if is_white else "black",
             })
         return jsonify({"games": result})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        logger.exception("Unable to fetch recent games")
+        return jsonify({"error": "Unable to fetch recent games."}), 502
 
 
 @app.route("/api/eval", methods=["POST"])
 def api_eval():
     """Run Stockfish depth-15 on a FEN, return centipawn score from White's POV."""
-    fen = request.json.get("fen", "")
+    fen = _request_data().get("fen", "")
     try:
         with _analysis_lock:
             sf = _get_analysis_sf()
@@ -206,15 +432,18 @@ def api_eval():
                 m = score.mate()
                 return jsonify({"cp": 10000 if m > 0 else -10000, "is_mate": True, "mate": m})
             return jsonify({"cp": score.score(), "is_mate": False, "mate": None})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        logger.exception("Position evaluation failed")
+        with _analysis_lock:
+            _discard_analysis_sf()
+        return jsonify({"error": "Position evaluation failed."}), 500
 
 
 
 @app.route("/api/lines", methods=["POST"])
 def api_lines():
     """Run Stockfish multipv=3 depth-15 on a FEN; return top-3 lines with SAN continuations."""
-    fen = request.json.get("fen", "")
+    fen = _request_data().get("fen", "")
     try:
         with _analysis_lock:
             sf = _get_analysis_sf()
@@ -250,8 +479,11 @@ def api_lines():
         ev = lines[0] if lines else {"cp": 0, "is_mate": False, "mate": None}
         return jsonify({"lines": lines,
                         "eval_cp": ev["cp"], "eval_is_mate": ev["is_mate"], "eval_mate": ev["mate"]})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        logger.exception("Line analysis failed")
+        with _analysis_lock:
+            _discard_analysis_sf()
+        return jsonify({"error": "Line analysis failed."}), 500
 
 
 HTML = r"""<!DOCTYPE html>
@@ -259,8 +491,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <title>Alan Dai</title>
-<link rel="stylesheet"
-      href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
+<link rel="stylesheet" href="/static/vendor/chessboard-1.0.0.min.css">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -736,9 +967,9 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div><!-- #analyze-section -->
 
-<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-<script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<script src="/static/vendor/jquery-3.7.1.min.js"></script>
+<script src="/static/vendor/chessboard-1.0.0.min.js"></script>
+<script src="/static/vendor/chess-0.10.3.min.js"></script>
 <script>
 let board, game;
 let botColor, humanColor;
@@ -967,20 +1198,27 @@ document.getElementById('board').addEventListener('click', _boardClickHandler, t
 
 // ── Server communication ───────────────────────────────────────────────────
 
+let serverVersion = 0;
+
 function submitMove(uci) {
   fetch('/move', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ uci })
+    body: JSON.stringify({ uci, expected_version: serverVersion })
   }).then(r => r.json()).then(handleStateUpdate);
 }
 
 function triggerBotMove() {
   document.getElementById('status').textContent = 'Alan Dai is thinking…';
-  fetch('/bot_move', { method: 'POST' }).then(r => r.json()).then(handleStateUpdate);
+  fetch('/bot_move', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expected_version: serverVersion })
+  }).then(r => r.json()).then(handleStateUpdate);
 }
 
 function handleStateUpdate(data) {
+  if (Number.isInteger(data.version)) serverVersion = data.version;
   if (data.error) {
     document.getElementById('status').textContent = data.error;
     if (data.error === 'No game in progress.') {
@@ -1100,6 +1338,7 @@ function startGameWith(tc, botSide, isRematch) {
 }
 
 function initBoard(data) {
+  serverVersion = data.version || 0;
   game = new Chess();
   gameOver = false;
   clearPremove();
@@ -1125,7 +1364,7 @@ function initBoard(data) {
     onDrop,
     onSnapEnd,
     onMoveEnd:       () => applyHighlights(null),
-    pieceTheme:      'https://chessboardjs.com/img/chesspieces/wikipedia/{piece}.png',
+    pieceTheme:      '/static/pieces/{piece}.png',
   });
 
   updateClocks(data);
@@ -1151,6 +1390,7 @@ function setGameButtons(over) {
 function syncState() {
   if (gameOver) return;
   fetch('/state').then(r => r.json()).then(data => {
+    if (Number.isInteger(data.version)) serverVersion = data.version;
     updateClocks(data);
     if (data.over && !gameOver) {
       gameOver = true;
@@ -1274,7 +1514,7 @@ function openGameViewer(g) {
     onDragStart:     () => { document.body.classList.add('is-dragging'); return true; },
     onDrop:          avOnDrop,
     onSnapEnd:       avOnSnapEnd,
-    pieceTheme:      'https://chessboardjs.com/img/chesspieces/wikipedia/{piece}.png',
+    pieceTheme:      '/static/pieces/{piece}.png',
   });
 
   renderAvMoveList();
@@ -1511,54 +1751,110 @@ def index():
 
 @app.route("/new_game", methods=["POST"])
 def new_game():
-    data = request.json
+    global _reserved_games
+    if MODEL_ERROR is not None:
+        return jsonify({"error": "Chess model is unavailable."}), 503
+    data = _request_data()
     tc         = data.get("tc", "blitz")
     bot_color  = data.get("bot_color", "black")
     is_rematch = bool(data.get("is_rematch", False))
     if tc not in TIME_CONTROLS:
-        tc = "blitz"
-    with _lock:
-        state.clear()
+        return jsonify({"error": "Unsupported time control."}), 400
+    if bot_color not in ("white", "black"):
+        return jsonify({"error": "bot_color must be 'white' or 'black'."}), 400
+
+    _prune_games()
+    old_token, old_game = _current_game()
+    with _games_lock:
+        if old_token in _creating_tokens:
+            return jsonify({"error": "Game creation already in progress."}), 409
+        if old_game is None and len(_games) + _reserved_games >= MAX_ACTIVE_GAMES:
+            return jsonify({"error": "Server is at game capacity. Try again shortly."}), 503
+        if old_token:
+            _creating_tokens.add(old_token)
+        if old_game is None:
+            _reserved_games += 1
+    token = secrets.token_urlsafe(32)
+    try:
         s = _new_state(tc, bot_color)
-        s["is_rematch"] = is_rematch
-        state.update(s)
-    return jsonify(_board_json(state))
+    except Exception:
+        logger.exception("Unable to initialize a new game")
+        with _games_lock:
+            if old_token:
+                _creating_tokens.discard(old_token)
+            if old_game is None:
+                _reserved_games -= 1
+        return jsonify({"error": "Chess engine is unavailable."}), 503
+    s["is_rematch"] = is_rematch
+    with _games_lock:
+        if old_token:
+            _creating_tokens.discard(old_token)
+        if old_game is None:
+            _reserved_games -= 1
+        _games[token] = s
+        if old_token:
+            _games.pop(old_token, None)
+    if old_game is not None:
+        with old_game["lock"]:
+            old_game["over"] = True
+            old_game["version"] += 1
+            old_game["engine"].close()
+
+    response = jsonify(_board_json(s))
+    response.set_cookie(
+        GAME_COOKIE, token, httponly=True,
+        secure=request.is_secure or os.environ.get("COOKIE_SECURE", "0") == "1",
+        samesite="Lax", max_age=24 * 60 * 60,
+    )
+    return response
 
 
 @app.route("/resign", methods=["POST"])
 def resign():
-    with _lock:
-        if state.get("over"):
-            return jsonify({"error": "Game is already over."})
-        state["over"]   = True
-        state["result"] = "You resigned — Alan Dai wins!"
-        return jsonify(_board_json(state))
+    _, s, error = _game_or_error()
+    if error:
+        return error
+    with s["lock"]:
+        if s.get("over"):
+            return jsonify({"error": "Game is already over."}), 409
+        s["over"] = True
+        s["result"] = "You resigned — Alan Dai wins!"
+        s["version"] += 1
+        return jsonify(_board_json(s))
 
 
 @app.route("/abort", methods=["POST"])
 def abort():
-    with _lock:
-        if state.get("over"):
-            return jsonify({"error": "Game is already over."})
-        board: chess.Board = state["board"]
+    _, s, error = _game_or_error()
+    if error:
+        return error
+    with s["lock"]:
+        if s.get("over"):
+            return jsonify({"error": "Game is already over."}), 409
+        board: chess.Board = s["board"]
         if board.fullmove_number > 2:
             return jsonify({"error": "Too late to abort — use Resign instead."}), 400
-        state["over"]   = True
-        state["result"] = "Game aborted."
-        return jsonify(_board_json(state))
+        s["over"] = True
+        s["result"] = "Game aborted."
+        s["version"] += 1
+        return jsonify(_board_json(s))
 
 
 @app.route("/move", methods=["POST"])
 def human_move():
-    uci = request.json.get("uci", "")
-    with _lock:
-        if "board" not in state:
-            return jsonify({"error": "No game in progress."}), 400
-        if state.get("over"):
-            return jsonify({"error": "Game is over."})
-        board: chess.Board = state["board"]
-        if board.turn == state["bot_color"]:
-            return jsonify({"error": "Not your turn."})
+    data = _request_data()
+    uci = data.get("uci", "")
+    _, s, error = _game_or_error()
+    if error:
+        return error
+    with s["lock"]:
+        if not _version_matches(s, data):
+            return jsonify({"error": "Position changed.", **_board_json(s)}), 409
+        if s.get("over"):
+            return jsonify({"error": "Game is over."}), 409
+        board: chess.Board = s["board"]
+        if board.turn == s["bot_color"]:
+            return jsonify({"error": "Not your turn."}), 409
         try:
             move = chess.Move.from_uci(uci)
             if move not in board.legal_moves:
@@ -1569,37 +1865,54 @@ def human_move():
         except Exception:
             return jsonify({"error": "Bad move format."}), 400
 
-        _tick_clock(state)
+        _tick_clock(s)
+        _check_game_over(s)
+        if s["over"]:
+            return jsonify(_board_json(s)), 409
         san = board.san(move)
         board.push(move)
-        state["moves"].append(san)
-        state["last_move"] = [move.from_square, move.to_square]
-        _check_game_over(state)
-        return jsonify(_board_json(state))
+        s["moves"].append(san)
+        s["last_move"] = [move.from_square, move.to_square]
+        s["version"] += 1
+        _check_game_over(s)
+        return jsonify(_board_json(s))
 
 
 @app.route("/bot_move", methods=["POST"])
 def bot_move():
     # Phase 1: compute the move quickly, then release the lock so the UI
     # can keep polling /state (and ticking the clock) during the think delay.
-    with _lock:
-        if "board" not in state:
-            return jsonify({"error": "No game in progress."}), 400
-        if state.get("over"):
-            return jsonify(_board_json(state))
-        board: chess.Board = state["board"]
-        if board.turn != state["bot_color"]:
-            return jsonify({"error": "Not bot's turn."})
+    data = _request_data()
+    token, s, error = _game_or_error()
+    if error:
+        return error
+    with s["lock"]:
+        if not _version_matches(s, data):
+            return jsonify({"error": "Position changed.", **_board_json(s)}), 409
+        if s.get("over"):
+            return jsonify(_board_json(s))
+        if s["bot_busy"]:
+            return jsonify({"error": "Bot move already in progress.", **_board_json(s)}), 409
+        board: chess.Board = s["board"]
+        if board.turn != s["bot_color"]:
+            return jsonify({"error": "Not bot's turn."}), 409
 
-        _tick_clock(state)
-        engine: ChessBotEngine = state["engine"]
-        move = engine.get_move(board, state["bot_clock"],
-                               is_rematch=state["is_rematch"])
-        think_delay = state["think_timer"].get_delay(
+        _tick_clock(s)
+        start_version = s["version"]
+        s["bot_busy"] = True
+        engine: ChessBotEngine = s["engine"]
+        try:
+            move = engine.get_move(board, s["bot_clock"],
+                                   is_rematch=s["is_rematch"])
+        except Exception:
+            s["bot_busy"] = False
+            logger.exception("Bot move calculation failed")
+            return jsonify({"error": "Chess engine failed to calculate a move."}), 503
+        think_delay = s["think_timer"].get_delay(
             board,
             engine.last_gap_cp,
             move,
-            state["bot_clock"],
+            s["bot_clock"],
             from_book=engine.last_from_book,
         )
 
@@ -1608,52 +1921,94 @@ def bot_move():
     time.sleep(think_delay)
 
     # Phase 3: apply the move.
-    with _lock:
-        if state.get("over"):
-            return jsonify(_board_json(state))
-        _tick_clock(state)   # accounts for the think_delay elapsed above
-        san = state["board"].san(move)
-        state["board"].push(move)
-        state["moves"].append(san)
-        state["last_move"] = [move.from_square, move.to_square]
-        _check_game_over(state)
-        return jsonify(_board_json(state))
+    with _games_lock:
+        current = _games.get(token)
+    with s["lock"]:
+        s["bot_busy"] = False
+        if current is not s or s["version"] != start_version:
+            return jsonify({"error": "Position changed; bot move discarded."}), 409
+        if s.get("over"):
+            return jsonify(_board_json(s))
+        if move not in s["board"].legal_moves:
+            logger.error("Calculated bot move became illegal: %s", move)
+            return jsonify({"error": "Calculated move is no longer legal."}), 409
+        _tick_clock(s)
+        _check_game_over(s)
+        if s["over"]:
+            return jsonify(_board_json(s))
+        san = s["board"].san(move)
+        s["board"].push(move)
+        s["moves"].append(san)
+        s["last_move"] = [move.from_square, move.to_square]
+        s["version"] += 1
+        _check_game_over(s)
+        return jsonify(_board_json(s))
 
 
 @app.route("/state")
 def get_state():
-    with _lock:
-        if not state:
-            return jsonify({"error": "No game in progress."})
-        _tick_clock(state)
-        _check_game_over(state)
-        return jsonify(_board_json(state))
+    _, s, error = _game_or_error()
+    if error:
+        return error
+    with s["lock"]:
+        _tick_clock(s)
+        _check_game_over(s)
+        return jsonify(_board_json(s))
 
 
 @app.route("/debug")
 def debug():
+    """Non-sensitive compatibility endpoint; prefer /health/live and /health/ready."""
     info = {
         "username": USERNAME,
-        "stockfish_path": STOCKFISH_PATH,
-        "stockfish_exists": os.path.isfile(STOCKFISH_PATH) if STOCKFISH_PATH else False,
-        "stockfish_which": shutil.which("stockfish"),
-        "model_path": MODEL_PATH,
-        "model_exists": os.path.isfile(MODEL_PATH),
+        "model_ready": MODEL_ERROR is None,
+        "active_games": len(_games),
     }
-    with _lock:
-        if state:
-            engine = state.get("engine")
-            info["engine_loaded"] = engine is not None
-            if engine:
-                info["stockfish_enabled"] = engine.stockfish is not None
-                info["last_gap_cp"] = engine.last_gap_cp
-                info["device"] = str(engine.device)
-        else:
-            info["engine_loaded"] = False
     return jsonify(info)
+
+
+@app.route("/health/live")
+def health_live():
+    return jsonify({"status": "ok"})
+
+
+@app.route("/health/ready")
+def health_ready():
+    if MODEL_ERROR is not None:
+        return jsonify({"status": "not_ready", "model": "failed"}), 503
+    # Stockfish is optional for legal move generation, but report the deployment as
+    # degraded when it is absent because the safety filter is then disabled.
+    stockfish_ready = _stockfish_is_ready()
+    status = 200 if stockfish_ready else 503
+    return jsonify({
+        "status": "ready" if stockfish_ready else "not_ready",
+        "model": "ready",
+        "stockfish": "ready" if stockfish_ready else "unavailable",
+    }), status
+
+
+def _shutdown_engines():
+    global _analysis_sf
+    _shutdown_event.set()
+    with _games_lock:
+        games = list(_games.values())
+        _games.clear()
+    for game in games:
+        with game["lock"]:
+            game["engine"].close()
+    with _analysis_lock:
+        engine, _analysis_sf = _analysis_sf, None
+        if engine is not None:
+            try:
+                engine.quit()
+            except Exception:
+                logger.exception("Failed to close analysis Stockfish")
+
+
+atexit.register(_shutdown_engines)
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
     print(f"Open http://localhost:{port} in your browser")
-    app.run(debug=False, host="0.0.0.0", port=port)
+    app.run(debug=False, host="0.0.0.0", port=port, threaded=True)

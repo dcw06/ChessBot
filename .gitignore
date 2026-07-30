@@ -1,4 +1,5 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -6,3 +7,7 @@ __pycache__/
 .env
 local_games.json
 *.pgn
+*.onnx.data
+checkpoint.pt
+analyze_style*.py
+*_analysis.py

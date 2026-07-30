@@ -3,6 +3,7 @@ import chess.pgn
 import torch
 import numpy as np
 from torch.utils.data import Dataset
+from bot.model_contract import NUM_ACTIONS, NUM_PLANES
 
 PIECE_PLANE = {
     (chess.PAWN,   chess.WHITE): 0,
@@ -19,14 +20,11 @@ PIECE_PLANE = {
     (chess.KING,   chess.BLACK): 11,
 }
 
-# Promotion pieces encoded as an offset beyond 4096 (the 64×64 from-to space).
-# Each promotion type gets its own band of 64 destination squares.
-# Index = 4096 + promo_offset[piece] * 64 + to_square
+# Under-promotions use piece × direction × destination bands beyond the 64×64
+# from-to space. Retaining the direction prevents capture promotions from
+# colliding when two pawns can promote onto the same square.
 _PROMO_OFFSET = {chess.ROOK: 0, chess.BISHOP: 1, chess.KNIGHT: 2}
-NUM_ACTIONS = 4096 + 3 * 64   # queen-promo reuses the base 4096 slot
-
-# 12 piece planes + turn + 4 castling + en passant + 2 repetition + 50-move clock
-NUM_PLANES = 21
+# NUM_ACTIONS and NUM_PLANES come from the versioned serving contract.
 
 
 def board_to_tensor(board: chess.Board, flip: bool = False) -> torch.Tensor:
@@ -87,7 +85,8 @@ def move_to_index(move: chess.Move) -> int:
     Under-promotions (R, B, N) use slots above 4096 to avoid conflicting gradients.
     """
     if move.promotion and move.promotion != chess.QUEEN:
-        return 4096 + _PROMO_OFFSET[move.promotion] * 64 + move.to_square
+        direction = chess.square_file(move.from_square) - chess.square_file(move.to_square) + 1
+        return 4096 + _PROMO_OFFSET[move.promotion] * 192 + direction * 64 + move.to_square
     return move.from_square * 64 + move.to_square
 
 
@@ -109,19 +108,25 @@ def index_to_move(idx: int, board: chess.Board = None) -> chess.Move:
     """Decode a move index back to a chess.Move.
 
     Pass board to correctly handle all promotions:
-    - Under-promotions (idx ≥ 4096): board is used to locate the promoting pawn's
-      from-square (lost in encoding because only to_square is stored).
+    - Under-promotions (idx ≥ 4096): board validates the encoded origin direction.
     - Queen promotions (idx < 4096): board is used to detect that a pawn is moving
       to the back rank (queen promotion flag otherwise absent from the encoding).
     """
     if idx >= 4096:
-        promo_band = (idx - 4096) // 64
-        to_sq = (idx - 4096) % 64
+        promo_band, remainder = divmod(idx - 4096, 192)
+        direction, to_sq = divmod(remainder, 64)
         promo_piece = [chess.ROOK, chess.BISHOP, chess.KNIGHT][promo_band]
         if board is None:
             raise ValueError("board is required to decode under-promotion index")
-        from_sq = _find_promoting_pawn(board, to_sq)
-        return chess.Move(from_sq, to_sq, promotion=promo_piece)
+        candidates = [
+            move for move in board.legal_moves
+            if move.to_square == to_sq and move.promotion == promo_piece
+            and chess.square_file(move.from_square) - chess.square_file(move.to_square) + 1
+            == direction
+        ]
+        if len(candidates) != 1:
+            raise ValueError(f"ambiguous or illegal promotion index: {idx}")
+        return candidates[0]
     from_sq, to_sq = idx // 64, idx % 64
     if board is not None:
         piece = board.piece_at(from_sq)
@@ -182,9 +187,9 @@ def load_game_positions(
             black = game.headers.get("Black", "").lower()
             result = game.headers.get("Result", "*")
 
-            if username in white:
+            if username == white:
                 user_color = chess.WHITE
-            elif username in black:
+            elif username == black:
                 user_color = chess.BLACK
             else:
                 continue
@@ -195,6 +200,8 @@ def load_game_positions(
                 if user_color == chess.BLACK and result != "0-1":
                     continue
 
+            if result not in {"1-0", "0-1", "1/2-1/2"}:
+                continue
             if result == "1-0":
                 outcome = 1.0 if user_color == chess.WHITE else 0.0
             elif result == "0-1":

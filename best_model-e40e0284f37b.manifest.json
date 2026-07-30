@@ -1,0 +1,40 @@
+{
+  "action_encoding": "from_square*64+to_square; underpromotions=r,b,n bands",
+  "action_encoding_version": 1,
+  "canonicalization": "vertical-rank-flip-and-color-swap-for-black",
+  "created_at": "2026-07-30T13:18:40.448570+00:00",
+  "dataset_file": "all_games.pgn",
+  "dataset_sha256": "7085c288b33a6b6e95f376d6688b84b6f07329cb5ab18d0129be597297afa08a",
+  "feature_schema_version": 1,
+  "halfmove_clock_divisor": 100.0,
+  "halfmove_clock_plane": 20,
+  "input_name": "input",
+  "manifest_format_version": 1,
+  "metrics": {},
+  "model_file": "best_model-e40e0284f37b.onnx",
+  "model_sha256": "e40e0284f37b9605a59f7d1adadfaab35708697a7bec633cab16996f8ec331d7",
+  "num_actions": 4288,
+  "num_planes": 21,
+  "numerical_validation": {
+    "atol": 1e-05,
+    "policy_max_abs_error": 3.0517578125e-05,
+    "rtol": 0.0001,
+    "samples": 4,
+    "value_max_abs_error": 1.6093254089355469e-06
+  },
+  "opset_version": 17,
+  "policy_output_name": "policy",
+  "self_contained": true,
+  "source_checkpoint_file": "best_model.pt",
+  "source_checkpoint_sha256": "381bd1b7db360cc072c80535bf83c6cab2706449d870513669fe78107f31150d",
+  "source_revision": "75cb3b9c1396b735528dcf1ef63dfdef28329a9f",
+  "source_tree_dirty": true,
+  "tool_versions": {
+    "onnx": "1.22.0",
+    "onnxruntime": "1.27.0",
+    "python": "3.11.15",
+    "torch": "2.12.0"
+  },
+  "username": "yuandan",
+  "value_output_name": "value"
+}

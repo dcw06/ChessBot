@@ -7,6 +7,12 @@ from torch.utils.data import DataLoader
 
 from model import ChessNet
 from dataset import load_game_positions, GamesDataset, NUM_ACTIONS
+from scripts.export_model import export_model
+from bot.model_contract import (
+    ACTION_ENCODING_VERSION,
+    FEATURE_SCHEMA_VERSION,
+    sha256_file,
+)
 
 USERNAME  = "yuandan"
 PGN_FILE  = "pgns/all_games.pgn"
@@ -30,26 +36,36 @@ def train():
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
     device = get_device()
     print(f"Using device: {device}")
 
     # --- Game-level split (prevents data leakage) ---
     all_games = load_game_positions(PGN_FILE, USERNAME)
+    if len(all_games) < 2:
+        raise RuntimeError("Training requires at least two completed games")
     random.shuffle(all_games)
 
     split    = int(0.9 * len(all_games))
     train_ds = GamesDataset(all_games[:split])
     val_ds   = GamesDataset(all_games[split:])
+    if not train_ds or not val_ds:
+        raise RuntimeError("Training and validation splits must both contain positions")
     print(f"Train: {len(train_ds)} positions from {split} games")
     print(f"Val:   {len(val_ds)} positions from {len(all_games) - split} games")
 
     is_cuda = device.type == "cuda"
     is_mps  = device.type == "mps"
     num_workers = 4 if is_cuda else 0  # MPS + multiprocessing deadlocks on macOS
+    loader_generator = torch.Generator().manual_seed(SEED)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=num_workers, pin_memory=is_cuda,
-                              persistent_workers=num_workers > 0)
+                              persistent_workers=num_workers > 0,
+                              generator=loader_generator)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=num_workers, pin_memory=is_cuda,
                               persistent_workers=num_workers > 0)
@@ -63,12 +79,27 @@ def train():
     policy_criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
     value_criterion  = nn.MSELoss()
 
-    best_val_acc  = 0.0
+    # Ensure the first completed validation epoch always creates the checkpoint
+    # consumed by the automatic export, even when initial accuracy is zero.
+    best_val_acc  = -1.0
     patience_left = PATIENCE
     start_epoch   = 1
 
     if os.path.exists("checkpoint.pt"):
         ckpt = torch.load("checkpoint.pt", map_location=device, weights_only=True)
+        expected_metadata = {
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            "action_encoding_version": ACTION_ENCODING_VERSION,
+            "num_actions": NUM_ACTIONS,
+            "dataset_sha256": sha256_file(PGN_FILE),
+            "username": USERNAME,
+        }
+        for key, expected in expected_metadata.items():
+            if ckpt.get("metadata", {}).get(key) != expected:
+                raise RuntimeError(
+                    f"Checkpoint metadata mismatch for {key}: "
+                    f"expected {expected!r}, got {ckpt.get('metadata', {}).get(key)!r}"
+                )
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
@@ -134,6 +165,13 @@ def train():
                 "epoch":        epoch,
                 "best_val_acc": best_val_acc,
                 "patience_left": patience_left,
+                "metadata": {
+                    "feature_schema_version": FEATURE_SCHEMA_VERSION,
+                    "action_encoding_version": ACTION_ENCODING_VERSION,
+                    "num_actions": NUM_ACTIONS,
+                    "dataset_sha256": sha256_file(PGN_FILE),
+                    "username": USERNAME,
+                },
             }, "checkpoint.pt")
             print(f"           ^ saved best model (val={val_acc:.3f})")
         else:
@@ -141,6 +179,16 @@ def train():
             if patience_left == 0:
                 print(f"No improvement for {PATIENCE} epochs — stopping early.")
                 break
+
+    if not os.path.isfile("best_model.pt"):
+        raise RuntimeError("Training completed without producing best_model.pt")
+    export_model(
+        checkpoint_path="best_model.pt",
+        output_path="best_model.onnx",
+        username=USERNAME,
+        dataset_path=PGN_FILE,
+        metrics={"best_validation_policy_accuracy": best_val_acc},
+    )
 
 
 if __name__ == "__main__":

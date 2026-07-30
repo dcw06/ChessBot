@@ -1,0 +1,5 @@
+{
+  "manifest": "best_model-e40e0284f37b.manifest.json",
+  "model": "best_model-e40e0284f37b.onnx",
+  "release_format_version": 1
+}

@@ -1,10 +1,12 @@
 import chess
+import os
 import time
 
 from bot import ChessBotEngine
+from bot.model_contract import resolve_release_paths
 
 USERNAME = "yuandan"
-MODEL_PATH = "best_model.pt"
+MODEL_PATH = "best_model.onnx"
 OPENING_BOOK_PATH = "opening_book.json"
 
 TIME_CONTROLS = {
@@ -16,6 +18,9 @@ TIME_CONTROLS = {
 
 def play():
     print("=== ChessBot (yuandan clone) ===\n")
+    model_path, manifest_path = resolve_release_paths(MODEL_PATH)
+    if not model_path.is_file():
+        raise SystemExit(f"Model not found: {model_path}")
 
     print("Time control:")
     print("  1  →  1 min  bullet")
@@ -30,7 +35,8 @@ def play():
 
     bot = ChessBotEngine(
         time_control=tc_name,
-        model_path=MODEL_PATH,
+        model_path=str(model_path),
+        model_manifest_path=str(manifest_path),
         username=USERNAME,
         opening_book_path=OPENING_BOOK_PATH,
     )

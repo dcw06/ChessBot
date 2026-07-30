@@ -5,6 +5,13 @@ move_to_index, and flip_move without the torch dependency.
 import chess
 import numpy as np
 
+from .model_contract import (
+    ACTION_ENCODING_VERSION,
+    LEGACY_NUM_ACTIONS,
+    NUM_ACTIONS,
+    NUM_PLANES,
+)
+
 _PIECE_PLANE = {
     (chess.PAWN,   chess.WHITE): 0,
     (chess.KNIGHT, chess.WHITE): 1,
@@ -21,11 +28,10 @@ _PIECE_PLANE = {
 }
 
 _PROMO_OFFSET = {chess.ROOK: 0, chess.BISHOP: 1, chess.KNIGHT: 2}
-NUM_ACTIONS = 4096 + 3 * 64
 
 
 def board_to_tensor(board: chess.Board, flip: bool = False) -> np.ndarray:
-    planes = np.zeros((21, 8, 8), dtype=np.uint8)
+    planes = np.zeros((NUM_PLANES, 8, 8), dtype=np.uint8)
 
     for sq, piece in board.piece_map().items():
         r, c = divmod(sq, 8)
@@ -63,15 +69,56 @@ def board_to_tensor(board: chess.Board, flip: bool = False) -> np.ndarray:
     return planes
 
 
-def move_to_index(move: chess.Move) -> int:
+def move_to_index(move: chess.Move, version: int = ACTION_ENCODING_VERSION) -> int:
     if move.promotion and move.promotion != chess.QUEEN:
-        return 4096 + _PROMO_OFFSET[move.promotion] * 64 + move.to_square
+        if version == 1:
+            return 4096 + _PROMO_OFFSET[move.promotion] * 64 + move.to_square
+        direction = chess.square_file(move.from_square) - chess.square_file(move.to_square) + 1
+        return 4096 + _PROMO_OFFSET[move.promotion] * 192 + direction * 64 + move.to_square
     return move.from_square * 64 + move.to_square
 
 
-def flip_move(move: chess.Move) -> int:
+def index_to_move(
+    index: int, board: chess.Board, version: int = ACTION_ENCODING_VERSION
+) -> chess.Move:
+    """Decode an action index, including queen and under-promotions."""
+    limit = LEGACY_NUM_ACTIONS if version == 1 else NUM_ACTIONS
+    if not 0 <= index < limit:
+        raise ValueError(f"action index out of range: {index}")
+    if index >= 4096:
+        if version == 1:
+            band, to_square = divmod(index - 4096, 64)
+            direction = None
+        else:
+            band, remainder = divmod(index - 4096, 192)
+            direction, to_square = divmod(remainder, 64)
+        promotion = (chess.ROOK, chess.BISHOP, chess.KNIGHT)[band]
+        candidates = [
+            move for move in board.legal_moves
+            if move.to_square == to_square and move.promotion == promotion
+            and (
+                direction is None
+                or chess.square_file(move.from_square) - chess.square_file(move.to_square) + 1
+                == direction
+            )
+        ]
+    else:
+        from_square, to_square = divmod(index, 64)
+        candidates = [
+            move for move in board.legal_moves
+            if move.from_square == from_square and move.to_square == to_square
+        ]
+        queen = [move for move in candidates if move.promotion == chess.QUEEN]
+        if queen:
+            candidates = queen
+    if len(candidates) != 1:
+        raise ValueError(f"action index {index} is ambiguous or illegal for this board")
+    return candidates[0]
+
+
+def flip_move(move: chess.Move, version: int = ACTION_ENCODING_VERSION) -> int:
     def flip_sq(sq):
         return chess.square(chess.square_file(sq), 7 - chess.square_rank(sq))
     flipped = chess.Move(flip_sq(move.from_square), flip_sq(move.to_square),
                          promotion=move.promotion)
-    return move_to_index(flipped)
+    return move_to_index(flipped, version=version)
