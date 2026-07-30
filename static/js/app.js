@@ -154,7 +154,7 @@ function choosePromotion() {
   );
 }
 
-async function makeMove(from, to) {
+async function makeMove(from, to, animateBoard = true) {
   if (requestBusy || gameOver || game.turn() !== humanColor[0]) return false;
   const piece = game.get(from);
   let promotion = "q";
@@ -167,7 +167,7 @@ async function makeMove(from, to) {
   }
   const move = game.move({ from, to, promotion });
   if (!move) return false;
-  board.position(game.fen(), true);
+  if (animateBoard) board.position(game.fen(), true);
   clearSelection();
   setBusy(true, "Submitting your move…");
   try {
@@ -208,7 +208,12 @@ function onDrop(from, to) {
   if (!candidate) return "snapback";
   game.undo();
   clearSelection();
-  window.queueMicrotask(() => makeMove(from, to));
+  const isPromotion = candidate.flags.includes("p");
+  if (isPromotion) {
+    window.queueMicrotask(() => makeMove(from, to));
+    return "snapback";
+  }
+  makeMove(from, to, false);
   return undefined;
 }
 function onSnapEnd() {

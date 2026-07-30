@@ -192,6 +192,7 @@ button {
 .icon-button,
 .button,
 .choice-button,
+.game-card,
 .nav-tab {
   border: 1px solid var(--border);
   background: var(--surface-2);
@@ -663,7 +664,17 @@ kbd {
   display: flex;
   align-items: center;
   gap: 0.75rem;
-  padding: 0.7rem;
+  padding: 0.8rem;
+  background: var(--surface-2);
+  border-color: var(--border);
+}
+.game-card:hover {
+  background: color-mix(in srgb, var(--surface-2) 84%, var(--primary));
+  box-shadow: 0 8px 24px rgb(0 0 0 / 16%);
+}
+.game-card:focus-visible {
+  position: relative;
+  z-index: 1;
 }
 .game-card-content {
   display: grid;
