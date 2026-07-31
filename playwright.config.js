@@ -1,4 +1,9 @@
 import { defineConfig, devices } from "@playwright/test";
+import { existsSync } from "node:fs";
+
+const python =
+  process.env.PYTHON ??
+  (existsSync("venv/bin/python") ? "venv/bin/python" : "python");
 
 export default defineConfig({
   testDir: "tests/frontend",
@@ -20,7 +25,7 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "PORT=5010 COOKIE_SECURE=0 venv/bin/python web_app.py",
+    command: `PORT=5010 COOKIE_SECURE=0 ${python} web_app.py`,
     url: "http://127.0.0.1:5010/health/live",
     reuseExistingServer: true,
     timeout: 120000,
