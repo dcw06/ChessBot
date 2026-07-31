@@ -59,6 +59,13 @@ test("analysis controls and empty states are keyboard reachable", async ({
   await expect(
     page.getByRole("heading", { name: "Saved games" }),
   ).toBeVisible();
+  await expect(page.locator("#analysis-context-controls")).toBeHidden();
+  await expect(page.locator("#model-chip")).toBeVisible();
+  await expect(page.locator("#stockfish-chip")).toBeVisible();
+  const toolbarHeight = await page
+    .locator(".analysis-toolbar")
+    .evaluate((element) => element.getBoundingClientRect().height);
+  expect(toolbarHeight).toBeLessThan(180);
   await page.keyboard.press("Tab");
   await expect(page.locator(":focus")).toBeVisible();
   await expect(page.getByRole("tab", { name: "Analyze" })).toHaveAttribute(
@@ -103,6 +110,7 @@ test("saved history uses only local bot games", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("tab", { name: "Analyze" }).click();
   await page.getByRole("button", { name: /vs Alan Dai/ }).click();
+  await expect(page.locator("#analysis-context-controls")).toBeVisible();
   await expect(page.locator("#av-board [data-square]")).toHaveCount(64);
   const boardSize = await page
     .locator("#av-board")
@@ -111,6 +119,40 @@ test("saved history uses only local bot games", async ({ page }) => {
   await page.locator("#analysis-return-btn").click();
   await expect(page.locator("#play-section")).toBeVisible();
   expect(chessComRequests).toBe(0);
+});
+
+test("end game and home terminates the game and returns to setup", async ({
+  page,
+}) => {
+  let ended = 0;
+  await page.route("**/new_game", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(initialState),
+    }),
+  );
+  await page.route("**/end_game", (route) => {
+    ended += 1;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ended: true }),
+    });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Start game" }).click();
+  await page.getByRole("button", { name: "End game & home" }).click();
+  await page
+    .locator("#confirm-dialog")
+    .getByRole("button", { name: "End game", exact: true })
+    .click();
+  await expect(page.locator("#setup-panel")).toBeVisible();
+  await expect(page.getByRole("tab", { name: "Play" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  expect(ended).toBe(1);
 });
 
 test("dragging a legal move keeps the piece on its destination", async ({
@@ -244,7 +286,19 @@ test("underpromotion choice is sent to the server", async ({ page }) => {
 
 test("mobile layout has no horizontal overflow", async ({ page, isMobile }) => {
   test.skip(!isMobile, "Mobile visual baseline only");
+  await page.route("**/health/ready", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "ready",
+        model: "ready",
+        stockfish: "ready",
+      }),
+    }),
+  );
   await page.goto("/");
+  await expect(page.locator("#stockfish-chip")).toHaveText("Stockfish ready");
   const overflow = await page.evaluate(
     () =>
       document.documentElement.scrollWidth -
@@ -262,7 +316,19 @@ test("desktop landing page matches its visual baseline", async ({
   isMobile,
 }) => {
   test.skip(isMobile, "Desktop visual baseline only");
+  await page.route("**/health/ready", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "ready",
+        model: "ready",
+        stockfish: "ready",
+      }),
+    }),
+  );
   await page.goto("/");
+  await expect(page.locator("#stockfish-chip")).toHaveText("Stockfish ready");
   await expect(page).toHaveScreenshot("landing-desktop.png", {
     fullPage: true,
     animations: "disabled",

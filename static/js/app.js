@@ -1,4 +1,4 @@
-import { api, CancelledRequest, post } from "./api.js";
+import { api, CancelledRequest, cancelRequest, post } from "./api.js";
 import { playSound, setSoundEnabled, soundEnabled } from "./sounds.js";
 import { classifyResult, formatClock } from "./chess-utils.js";
 
@@ -743,6 +743,7 @@ async function gameAction(path, confirmation) {
 
 async function switchTab(tab) {
   const analyze = tab === "analyze";
+  if (!analyze) analysisModule?.deactivateAnalysis();
   $("play-section").hidden = analyze;
   $("analyze-section").hidden = !analyze;
   document.querySelectorAll(".nav-tab").forEach((button) => {
@@ -753,6 +754,35 @@ async function switchTab(tab) {
   });
   if (analyze) (await getAnalysis()).loadRecentGames();
   resizeBoards();
+}
+
+async function endGameAndHome() {
+  if (
+    !(await confirmAction(
+      "End game and return home?",
+      "The current game will be terminated and will not be saved as a result.",
+      "End game",
+    ))
+  )
+    return;
+  setBusy(true, "Ending game…");
+  try {
+    await post("/end_game", {}, { timeout: 10000 });
+    gameOver = true;
+    lastState = null;
+    stopPolling();
+    cancelRequest("game-state");
+    cancelRequest("live-evaluation");
+    if ($("result-dialog").open) $("result-dialog").close();
+    $("game-panel").hidden = true;
+    $("setup-panel").hidden = false;
+    await switchTab("play");
+    announce("Game ended. Returned to the home screen.");
+  } catch (error) {
+    showError(error);
+  } finally {
+    setBusy(false);
+  }
 }
 
 async function returnToSetup() {
@@ -825,6 +855,7 @@ function bindEvents() {
   );
   $("start-btn").addEventListener("click", () => startGame());
   $("game-return-btn").addEventListener("click", returnToSetup);
+  $("end-game-home-btn").addEventListener("click", endGameAndHome);
   $("analysis-return-btn").addEventListener("click", () => switchTab("play"));
   $("retry-btn").addEventListener("click", () => {
     refreshHealth();
@@ -934,7 +965,17 @@ function bindEvents() {
       document.querySelector(`[data-tab="${tab}"]`).focus();
       return;
     }
-    if (["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName)) return;
+    if (
+      event.defaultPrevented ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.altKey ||
+      document.querySelector("dialog[open]") ||
+      event.target.closest(
+        "button, a, input, textarea, select, summary, [contenteditable='true']",
+      )
+    )
+      return;
     if (event.key.toLowerCase() === "n") startGame();
     if (event.key.toLowerCase() === "r" && !gameOver) $("resign-btn").click();
     if (event.key.toLowerCase() === "f" && board) board.flip();

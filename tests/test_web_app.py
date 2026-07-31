@@ -141,6 +141,19 @@ class WebAppTests(unittest.TestCase):
             client.post("/new_game", json={"tc": "invalid"}).status_code, 400
         )
 
+    def test_end_game_discards_current_game_without_saving_it(self):
+        client = web_app.app.test_client()
+        self._new_game(client)
+        before = len(client.get("/api/local-games").get_json()["games"])
+        ended = client.post("/end_game")
+        self.assertEqual(ended.status_code, 200)
+        self.assertTrue(ended.get_json()["ended"])
+        self.assertEqual(client.get("/state").status_code, 404)
+        self.assertEqual(
+            len(client.get("/api/local-games").get_json()["games"]), before
+        )
+        self.assertFalse(client.post("/end_game").get_json()["ended"])
+
     def test_cross_origin_mutation_is_rejected(self):
         client = web_app.app.test_client()
         response = client.post(

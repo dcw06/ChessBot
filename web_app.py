@@ -701,6 +701,26 @@ def abort():
         return jsonify(_board_json(s))
 
 
+@app.route("/end_game", methods=["POST"])
+def end_game():
+    """Idempotently discard the browser's current game without recording a result."""
+    token = request.cookies.get(GAME_COOKIE, "")
+    with _games_lock:
+        game = _games.pop(token, None) if token else None
+    if game is not None:
+        with game["lock"]:
+            game["over"] = True
+            game["version"] += 1
+            game["engine"].close()
+    response = jsonify({"ended": game is not None})
+    response.delete_cookie(
+        GAME_COOKIE,
+        secure=request.is_secure or os.environ.get("COOKIE_SECURE", "0") == "1",
+        samesite="Lax",
+    )
+    return response
+
+
 @app.route("/move", methods=["POST"])
 def human_move():
     data = _request_data()

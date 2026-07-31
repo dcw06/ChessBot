@@ -1,4 +1,4 @@
-import { api, CancelledRequest, post } from "./api.js";
+import { api, CancelledRequest, cancelRequest, post } from "./api.js";
 import { classifyMoveQuality, evaluationPercent } from "./chess-utils.js";
 
 const $ = (id) => document.getElementById(id);
@@ -18,6 +18,7 @@ function storageSet(key, value) {
 }
 let board;
 let boardObserver;
+let boardResizeObserver;
 let viewer = new Chess();
 let mainMoves = [];
 let mainIndex = 0;
@@ -44,6 +45,10 @@ function button(label, className = "button secondary") {
 
 function notify(message, kind = "info") {
   window.chessbotUI?.toast(message, kind);
+}
+
+function setAnalysisContext(active) {
+  $("analysis-context-controls").hidden = !active;
 }
 
 function filteredGames() {
@@ -339,7 +344,13 @@ function initializeBoard(orientation = "white") {
   boardObserver.observe($("av-board"), { childList: true, subtree: true });
   makeAnalysisBoardAccessible();
   setTimeout(makeAnalysisBoardAccessible, 0);
-  window.requestAnimationFrame(() => board?.resize());
+  boardResizeObserver ??= new window.ResizeObserver((entries) => {
+    if (entries.some((entry) => entry.contentRect.width > 0)) board?.resize();
+  });
+  boardResizeObserver.observe($("av-board-wrap"));
+  window.requestAnimationFrame(() =>
+    window.requestAnimationFrame(() => board?.resize()),
+  );
 }
 
 export function openGame(game) {
@@ -359,6 +370,7 @@ export function openGame(game) {
   analysisModified = false;
   $("recent-games-panel").hidden = true;
   $("av-game-view").hidden = false;
+  setAnalysisContext(true);
   initializeBoard(game.user_color || "white");
   $("av-game-title").textContent =
     `${game.result || "Analysis"} · ${game.opponent || "Imported game"} · ${game.opening || ""}`;
@@ -489,6 +501,7 @@ function importText(kind) {
         analysisModified = true;
         $("recent-games-panel").hidden = true;
         $("av-game-view").hidden = false;
+        setAnalysisContext(true);
         initializeBoard();
         $("av-game-title").textContent = "Custom position";
         renderMoveTree();
@@ -515,6 +528,7 @@ function download(name, contents, type = "text/plain") {
 }
 
 export function initAnalysis() {
+  setAnalysisContext(false);
   window.addEventListener("chessbot:resize-analysis", () => board?.resize());
   ["game-search", "game-result-filter", "game-speed-filter"].forEach((id) =>
     $(id).addEventListener("input", () => {
@@ -532,8 +546,12 @@ export function initAnalysis() {
   });
   $("refresh-games-btn").addEventListener("click", () => loadRecentGames(true));
   $("analysis-back-btn").addEventListener("click", () => {
+    cancelRequest("analysis-lines");
+    clearTimeout(debounce);
+    $("analysis-progress").hidden = true;
     $("av-game-view").hidden = true;
     $("recent-games-panel").hidden = false;
+    setAnalysisContext(false);
   });
   document.querySelectorAll("[data-analysis-nav]").forEach((control) =>
     control.addEventListener("click", () => {
@@ -600,6 +618,7 @@ export function initAnalysis() {
       analysisModified = true;
       $("recent-games-panel").hidden = true;
       $("av-game-view").hidden = false;
+      setAnalysisContext(true);
       initializeBoard();
       $("av-game-title").textContent = "Shared position";
       renderMoveTree();
@@ -608,6 +627,12 @@ export function initAnalysis() {
       notify("This analysis link contains an invalid position.", "error");
     }
   }
+}
+
+export function deactivateAnalysis() {
+  clearTimeout(debounce);
+  cancelRequest("analysis-lines");
+  $("analysis-progress").hidden = true;
 }
 
 async function copyText(value, label) {
