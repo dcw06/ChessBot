@@ -580,6 +580,7 @@ kbd {
   left: 39%;
   top: 39%;
   pointer-events: none;
+  animation: legal-marker-in 280ms cubic-bezier(0.2, 0.9, 0.3, 1.25);
 }
 .legal-ring {
   position: absolute;
@@ -587,6 +588,21 @@ kbd {
   border: 5px solid rgb(25 30 36 / 35%);
   border-radius: 50%;
   pointer-events: none;
+  animation: legal-marker-in 280ms cubic-bezier(0.2, 0.9, 0.3, 1.25);
+}
+@keyframes legal-marker-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.35);
+  }
+  70% {
+    opacity: 1;
+    transform: scale(1.12);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
 }
 .vertical-eval {
   width: 28px;
@@ -813,6 +829,7 @@ kbd {
 .move-tree {
   min-height: 180px;
   max-height: 330px;
+  margin-top: -0.25rem;
   overflow: auto;
   display: grid;
   grid-template-columns: 2rem 1fr 1fr;

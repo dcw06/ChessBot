@@ -112,6 +112,26 @@ test("saved history uses only local bot games", async ({ page }) => {
   await page.getByRole("button", { name: /vs Alan Dai/ }).click();
   await expect(page.locator("#analysis-context-controls")).toBeVisible();
   await expect(page.locator("#av-board [data-square]")).toHaveCount(64);
+  await page
+    .locator("#av-board .square-e7")
+    .dragTo(page.locator("#av-board .square-e5"));
+  await expect(
+    page.locator('#av-board .square-e7 img[data-piece="bP"]'),
+  ).toBeVisible();
+  await page.locator("#av-board .square-e2").click();
+  await expect(page.locator("#av-board .square-e2")).toHaveClass(/sq-selected/);
+  await expect(page.locator("#av-board .square-e4 .legal-dot")).toBeVisible();
+  await page.locator("#av-board .square-e4").click();
+  await expect(
+    page.locator('#av-board .square-e4 img[data-piece="wP"]'),
+  ).toBeVisible();
+  await page.locator('[data-analysis-nav="start"]').click();
+  await page
+    .locator("#av-board .square-e2")
+    .dragTo(page.locator("#av-board .square-e4"));
+  await expect(
+    page.locator('#av-board .square-e4 img[data-piece="wP"]'),
+  ).toBeVisible();
   const boardSize = await page
     .locator("#av-board")
     .evaluate((element) => element.getBoundingClientRect().width);
@@ -119,6 +139,35 @@ test("saved history uses only local bot games", async ({ page }) => {
   await page.locator("#analysis-return-btn").click();
   await expect(page.locator("#play-section")).toBeVisible();
   expect(chessComRequests).toBe(0);
+});
+
+test("analysis supports underpromotion", async ({ page }) => {
+  await page.route("**/api/local-games", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ games: [] }),
+    }),
+  );
+  await page.route("**/api/lines", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ lines: [], eval_cp: 0, depth: 1 }),
+    }),
+  );
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Analyze" }).click();
+  await page.getByRole("button", { name: "Import FEN" }).click();
+  await page.locator("#input-value").fill("7k/P7/8/8/8/8/8/7K w - - 0 1");
+  await page.locator("#input-dialog button[value='submit']").click();
+  await page.locator("#av-board .square-a7").click();
+  await page.locator("#av-board .square-a8").click();
+  await expect(page.locator("#promotion-dialog")).toBeVisible();
+  await page.getByRole("button", { name: "Promote to knight" }).click();
+  await expect(
+    page.locator('#av-board .square-a8 img[data-piece="wN"]'),
+  ).toBeVisible();
 });
 
 test("end game and home terminates the game and returns to setup", async ({
@@ -194,6 +243,68 @@ test("dragging a legal move keeps the piece on its destination", async ({
   );
 });
 
+test("an uncertain move response is reconciled before rollback", async ({
+  page,
+}) => {
+  const accepted = {
+    ...initialState,
+    fen: "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
+    turn: "black",
+    moves: ["e4"],
+    version: 1,
+  };
+  await page.route("**/new_game", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(initialState),
+    }),
+  );
+  await page.route("**/move", (route) => route.abort("failed"));
+  await page.route("**/state", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(accepted),
+    }),
+  );
+  await page.route("**/bot_move", (route) => route.abort("failed"));
+  await page.goto("/");
+  await page.getByRole("button", { name: "Start game" }).click();
+  await page.locator("#board .square-e2").click();
+  await page.locator("#board .square-e4").click();
+  await expect(
+    page.locator('#board .square-e4 img[data-piece="wP"]'),
+  ).toBeVisible();
+  await expect(page.locator("#toast-region")).not.toContainText(
+    "Unable to reach",
+  );
+});
+
+test("black board arrow keys follow the visual orientation", async ({
+  page,
+}) => {
+  const blackToMove = {
+    ...initialState,
+    fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1",
+    bot_color: "white",
+    turn: "black",
+  };
+  await page.route("**/new_game", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(blackToMove),
+    }),
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "Black" }).click();
+  await page.getByRole("button", { name: "Start game" }).click();
+  await page.locator("#board .square-e7").focus();
+  await page.locator("#board .square-e7").press("ArrowUp");
+  await expect(page.locator("#board .square-e6")).toBeFocused();
+});
+
 test("keyboard board moves and thinking status stays outside the board", async ({
   page,
 }) => {
@@ -234,9 +345,14 @@ test("keyboard board moves and thinking status stays outside the board", async (
   });
   await page.goto("/");
   await page.getByRole("button", { name: "Start game" }).click();
-  await page.locator("#board .square-e2").press("Enter");
+  await page.locator("#board .square-e2").click();
   await expect(page.locator("#board .square-e2")).toHaveClass(/sq-selected/);
-  await page.locator("#board .square-e4").press("Enter");
+  await expect(page.locator("#board .square-e4 .legal-dot")).toBeVisible();
+  await expect(page.locator("#board .square-e4 .legal-dot")).toHaveCSS(
+    "animation-name",
+    "legal-marker-in",
+  );
+  await page.locator("#board .square-e4").click();
   await expect.poll(() => submittedMove).toBe("e2e4");
   await expect(page.locator("#status")).toHaveText("Alan Dai is thinking");
   await expect(page.locator("#board")).not.toContainText(

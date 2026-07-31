@@ -1,5 +1,6 @@
-import { api, CancelledRequest, cancelRequest, post } from "./api.js";
+import { api, ApiError, CancelledRequest, cancelRequest, post } from "./api.js";
 import { classifyMoveQuality, evaluationPercent } from "./chess-utils.js";
+import { createManagedBoard } from "./managed-board.js";
 
 const $ = (id) => document.getElementById(id);
 function storageGet(key) {
@@ -28,12 +29,18 @@ let games = [];
 let page = 1;
 const pageSize = 8;
 let debounce;
+let lastAnalysisRequestAt = 0;
+const ANALYSIS_DEBOUNCE_MS = 50;
+const ANALYSIS_MIN_INTERVAL_MS = 300;
+const ANALYSIS_CLICK_DELAY_MS = 80;
 const evaluations = new Map();
 let analysisGeneration = 0;
 let returnIndex = 0;
 let sourcePgn = "";
 let analysisModified = false;
 let analysisSelected = null;
+let analysisDragActive = false;
+let analysisOrientation = "white";
 
 function button(label, className = "button secondary") {
   const element = document.createElement("button");
@@ -222,44 +229,98 @@ function saveBranch(index, moves) {
 }
 
 function onDrop(from, to) {
+  analysisDragActive = false;
+  if (from === to) {
+    setTimeout(() => activateAnalysisSquare(from), ANALYSIS_CLICK_DELAY_MS);
+    return "snapback";
+  }
+  clearAnalysisSelection();
+  const piece = viewer.get(from);
+  const isPromotion = piece?.type === "p" && ["1", "8"].includes(to[1]);
+  if (isPromotion) {
+    window.queueMicrotask(() => makeAnalysisMove(from, to, true));
+    return "snapback";
+  }
   const move = viewer.move({ from, to, promotion: "q" });
   if (!move) return "snapback";
+  recordAnalysisMove(move);
+  return undefined;
+}
+
+function recordAnalysisMove(move, animateBoard = false) {
   variation.push(move);
   saveBranch(
     mainIndex,
     variation.map((item) => item.san),
   );
   analysisModified = true;
+  if (animateBoard) board.position(viewer.fen(), true);
   scheduleAnalysis();
   renderMoveTree();
+}
+
+async function makeAnalysisMove(from, to, animateBoard = true) {
+  const piece = viewer.get(from);
+  let promotion = "q";
+  if (piece?.type === "p" && ["1", "8"].includes(to[1])) {
+    promotion = await window.chessbotUI.choosePromotion();
+    if (!promotion) {
+      board.position(viewer.fen(), false);
+      return false;
+    }
+  }
+  const move = viewer.move({ from, to, promotion });
+  if (!move) return false;
+  recordAnalysisMove(move, animateBoard);
+  return true;
+}
+
+function clearAnalysisSelection() {
+  analysisSelected = null;
+  document
+    .querySelectorAll(
+      "#av-board .sq-selected,#av-board .legal-dot,#av-board .legal-ring",
+    )
+    .forEach((element) => {
+      if (element.classList.contains("sq-selected"))
+        element.classList.remove("sq-selected");
+      else element.remove();
+    });
+}
+
+function selectAnalysisSquare(square) {
+  clearAnalysisSelection();
+  analysisSelected = square;
+  document
+    .querySelector(`#av-board .square-${square}`)
+    ?.classList.add("sq-selected");
+  viewer.moves({ square, verbose: true }).forEach((move) => {
+    const target = document.querySelector(`#av-board .square-${move.to}`);
+    if (!target) return;
+    const marker = document.createElement("span");
+    marker.className = viewer.get(move.to) ? "legal-ring" : "legal-dot";
+    marker.setAttribute("aria-hidden", "true");
+    target.append(marker);
+  });
 }
 
 function activateAnalysisSquare(square) {
   const piece = viewer.get(square);
   if (!analysisSelected) {
-    if (piece?.color === viewer.turn()) analysisSelected = square;
+    if (piece?.color === viewer.turn()) selectAnalysisSquare(square);
+    return;
+  }
+  if (square === analysisSelected) {
+    clearAnalysisSelection();
     return;
   }
   if (piece?.color === viewer.turn()) {
-    analysisSelected = square;
+    selectAnalysisSquare(square);
     return;
   }
-  const move = viewer.move({
-    from: analysisSelected,
-    to: square,
-    promotion: "q",
-  });
-  analysisSelected = null;
-  if (!move) return;
-  variation.push(move);
-  saveBranch(
-    mainIndex,
-    variation.map((item) => item.san),
-  );
-  analysisModified = true;
-  board.position(viewer.fen(), true);
-  renderMoveTree();
-  scheduleAnalysis();
+  const from = analysisSelected;
+  clearAnalysisSelection();
+  makeAnalysisMove(from, square);
 }
 
 function makeAnalysisBoardAccessible(focusSquare = "e2") {
@@ -279,6 +340,7 @@ function makeAnalysisBoardAccessible(focusSquare = "e2") {
       const piece = viewer.get(square);
       element.setAttribute("role", "button");
       element.tabIndex = square === focusSquare ? 0 : -1;
+      element.onclick = analysisEmptySquareClick;
       element.onkeydown = analysisBoardKeydown;
       element.setAttribute(
         "aria-label",
@@ -287,6 +349,16 @@ function makeAnalysisBoardAccessible(focusSquare = "e2") {
           : `${square}, empty`,
       );
     });
+}
+
+function analysisEmptySquareClick(event) {
+  const square =
+    event.currentTarget.className.match(/square-([a-h][1-8])/)?.[1];
+  if (!square) return;
+  // Pieces belonging to the moving side are handled by onDrop because they
+  // start a drag. Empty squares and opposing pieces receive a regular click.
+  if (viewer.get(square)?.color !== viewer.turn())
+    activateAnalysisSquare(square);
 }
 
 function analysisBoardKeydown(event) {
@@ -299,13 +371,14 @@ function analysisBoardKeydown(event) {
     activateAnalysisSquare(square);
     return;
   }
-  const delta = {
+  let delta = {
     ArrowLeft: [-1, 0],
     ArrowRight: [1, 0],
     ArrowUp: [0, 1],
     ArrowDown: [0, -1],
   }[event.key];
   if (!delta) return;
+  if (analysisOrientation === "black") delta = delta.map((value) => -value);
   event.preventDefault();
   const file = Math.max(0, Math.min(7, square.charCodeAt(0) - 97 + delta[0]));
   const rank = Math.max(1, Math.min(8, Number(square[1]) + delta[1]));
@@ -314,20 +387,20 @@ function analysisBoardKeydown(event) {
   document.querySelector(`#av-board .square-${next}`)?.focus();
 }
 
-function analysisBoardClick(event) {
-  const square = event.target
-    .closest('[class*="square-"]')
-    ?.className.match(/square-([a-h][1-8])/)?.[1];
-  if (square) activateAnalysisSquare(square);
-}
-
 function initializeBoard(orientation = "white") {
+  analysisOrientation = orientation;
   board?.destroy();
-  board = Chessboard("av-board", {
+  board = createManagedBoard("av-board", {
     position: viewer.fen(),
     orientation,
     draggable: true,
     showNotation: window.chessbotPrefs?.coordinates !== false,
+    onDragStart: (source, piece) => {
+      if (piece[0] !== viewer.turn()) return false;
+      analysisDragActive = true;
+      selectAnalysisSquare(source);
+      return true;
+    },
     onDrop,
     onSnapEnd: () => {
       board.position(viewer.fen());
@@ -335,7 +408,6 @@ function initializeBoard(orientation = "white") {
     },
     pieceTheme: "/static/pieces/{piece}.png",
   });
-  $("av-board").addEventListener("click", analysisBoardClick);
   $("av-board").addEventListener("keydown", analysisBoardKeydown);
   boardObserver?.disconnect();
   boardObserver = new window.MutationObserver(() =>
@@ -351,6 +423,15 @@ function initializeBoard(orientation = "white") {
   window.requestAnimationFrame(() =>
     window.requestAnimationFrame(() => board?.resize()),
   );
+}
+
+function recoverCancelledAnalysisTouch() {
+  if (!analysisDragActive) return;
+  analysisDragActive = false;
+  const selected = analysisSelected;
+  initializeBoard(analysisOrientation);
+  if (selected && viewer.get(selected)?.color === viewer.turn())
+    selectAnalysisSquare(selected);
 }
 
 export function openGame(game) {
@@ -389,10 +470,22 @@ export function openGame(game) {
 
 function scheduleAnalysis() {
   clearTimeout(debounce);
-  debounce = setTimeout(analyzePosition, 120);
+  debounce = setTimeout(analyzePosition, ANALYSIS_DEBOUNCE_MS);
 }
 
 async function analyzePosition() {
+  const elapsed = performance.now() - lastAnalysisRequestAt;
+  if (elapsed < ANALYSIS_MIN_INTERVAL_MS) {
+    // Silently coalesce frequent navigation into one request for the final
+    // position instead of calling the API or showing an error.
+    clearTimeout(debounce);
+    debounce = setTimeout(
+      analyzePosition,
+      Math.ceil(ANALYSIS_MIN_INTERVAL_MS - elapsed),
+    );
+    return;
+  }
+  lastAnalysisRequestAt = performance.now();
   const generation = ++analysisGeneration;
   $("analysis-progress").hidden = false;
   try {
@@ -424,7 +517,16 @@ async function analyzePosition() {
     });
     renderMoveTree();
   } catch (error) {
-    if (!(error instanceof CancelledRequest)) notify(error.message, "error");
+    if (
+      !(error instanceof CancelledRequest) &&
+      !(error instanceof ApiError && error.status === 429)
+    )
+      notify(
+        error instanceof ApiError && error.status === 0
+          ? "You're moving too quickly. Please wait a moment and try again."
+          : error.message,
+        "error",
+      );
   } finally {
     if (generation === analysisGeneration) $("analysis-progress").hidden = true;
   }
@@ -529,6 +631,7 @@ function download(name, contents, type = "text/plain") {
 
 export function initAnalysis() {
   setAnalysisContext(false);
+  window.addEventListener("touchcancel", recoverCancelledAnalysisTouch);
   window.addEventListener("chessbot:resize-analysis", () => board?.resize());
   ["game-search", "game-result-filter", "game-speed-filter"].forEach((id) =>
     $(id).addEventListener("input", () => {

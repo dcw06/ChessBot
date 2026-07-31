@@ -166,11 +166,11 @@ class WebAppTests(unittest.TestCase):
     def test_rate_limit_stops_analysis_abuse(self):
         client = web_app.app.test_client()
         with mock.patch.object(web_app, "_get_analysis_sf", return_value=None):
-            for _ in range(30):
+            for _ in range(web_app.ANALYSIS_RATE_LIMIT):
                 client.post("/api/eval", json={"fen": "bad"})
-            self.assertEqual(
-                client.post("/api/eval", json={"fen": "bad"}).status_code, 429
-            )
+            response = client.post("/api/eval", json={"fen": "bad"})
+            self.assertEqual(response.status_code, 429)
+            self.assertEqual(response.headers["Retry-After"], "2")
 
     def test_custom_clock_and_increment_are_applied(self):
         client = web_app.app.test_client()

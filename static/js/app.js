@@ -1,6 +1,7 @@
 import { api, CancelledRequest, cancelRequest, post } from "./api.js";
 import { playSound, setSoundEnabled, soundEnabled } from "./sounds.js";
 import { classifyResult, formatClock } from "./chess-utils.js";
+import { createManagedBoard } from "./managed-board.js";
 
 const $ = (id) => document.getElementById(id);
 function stored(key, fallback) {
@@ -38,6 +39,9 @@ let pollFailures = 0;
 let gameOver = true;
 let requestBusy = false;
 let selectedSquare = null;
+let suppressStationaryDropClick = false;
+let liveDragActive = false;
+let gameSyncFailed = false;
 let lastState = null;
 let lastMoveCount = 0;
 let lastEvaluatedVersion = -1;
@@ -66,7 +70,7 @@ function announce(message) {
     $("sr-announcer").textContent = message;
   });
 }
-window.chessbotUI = { toast, announce };
+window.chessbotUI = { toast, announce, choosePromotion };
 
 function setConnected(connected, message = "") {
   $("connection-dot").classList.toggle("online", connected);
@@ -87,7 +91,7 @@ async function refreshHealth() {
     $("stockfish-chip").textContent = `Stockfish ${data.stockfish}`;
     $("stockfish-chip").className =
       `status-chip ${data.stockfish === "ready" ? "ready" : "error"}`;
-    setConnected(true);
+    if (gameOver || !gameSyncFailed) setConnected(true);
   } catch (error) {
     const data = error.data || {};
     $("model-chip").textContent = `Model ${data.model || "unavailable"}`;
@@ -170,6 +174,7 @@ async function makeMove(from, to, animateBoard = true) {
   if (animateBoard) board.position(game.fen(), true);
   clearSelection();
   setBusy(true, "Submitting your move…");
+  const submittedVersion = serverVersion;
   try {
     const data = await post(
       "/move",
@@ -182,6 +187,29 @@ async function makeMove(from, to, animateBoard = true) {
     handleState(data, move);
     if (!data.over && data.turn === botColor) await requestBotMove();
   } catch (error) {
+    const uncertain = !error.status || error.status >= 500;
+    if (uncertain) {
+      try {
+        const state = await api("/state", {
+          key: "game-state",
+          timeout: 5000,
+          retries: 2,
+        });
+        if (state.version > submittedVersion) {
+          handleState(state, move);
+          if (!state.over && state.turn === botColor) await requestBotMove();
+          return true;
+        }
+      } catch {
+        gameSyncFailed = true;
+        setConnected(
+          false,
+          "Move submitted, but confirmation is delayed. Reconnecting…",
+        );
+        schedulePoll(500);
+        return true;
+      }
+    }
     game.undo();
     board.position(game.fen(), false);
     showError(error);
@@ -199,10 +227,22 @@ function onDragStart(source, piece) {
     piece[0] !== humanColor[0]
   )
     return false;
+  liveDragActive = true;
   selectSquare(source);
   return true;
 }
 function onDrop(from, to) {
+  liveDragActive = false;
+  if (from === to) {
+    // onDragStart already selected the piece and rendered its legal moves.
+    // Keep that state after release and ignore the synthetic click generated
+    // by chessboard.js for this stationary drag.
+    suppressStationaryDropClick = true;
+    setTimeout(() => {
+      suppressStationaryDropClick = false;
+    }, 0);
+    return "snapback";
+  }
   clearLegalMoves();
   const candidate = game.move({ from, to, promotion: "q" });
   if (!candidate) return "snapback";
@@ -221,7 +261,31 @@ function onSnapEnd() {
   applyHighlights();
 }
 
+function recoverCancelledBoardTouch() {
+  if (!liveDragActive || !lastState) return;
+  liveDragActive = false;
+  const selected = selectedSquare;
+  initializeBoard(lastState);
+  if (selected && game.get(selected)?.color === humanColor[0])
+    selectSquare(selected);
+}
+
+function onSnapbackEnd() {
+  if (!selectedSquare) return;
+  document
+    .querySelector(`#board .square-${selectedSquare}`)
+    ?.classList.add("sq-selected");
+  // Preserve markers that survived the snapback so their animation does not
+  // restart from zero opacity. Recreate them only after an actual redraw.
+  if (!document.querySelector("#board .legal-dot,#board .legal-ring"))
+    selectSquare(selectedSquare);
+}
+
 function boardClick(event) {
+  if (suppressStationaryDropClick) {
+    suppressStationaryDropClick = false;
+    return;
+  }
   if (gameOver || requestBusy || game.turn() !== humanColor[0]) return;
   const square = event.target
     .closest('[class*="square-"]')
@@ -278,13 +342,14 @@ function boardKeydown(event) {
     activateSquare(coordinate);
     return;
   }
-  const delta = {
+  let delta = {
     ArrowLeft: [-1, 0],
     ArrowRight: [1, 0],
     ArrowUp: [0, 1],
     ArrowDown: [0, -1],
   }[event.key];
   if (!delta) return;
+  if (humanColor === "black") delta = delta.map((value) => -value);
   event.preventDefault();
   const file = Math.max(
     0,
@@ -361,7 +426,7 @@ function applyHighlights() {
 function initializeBoard(state) {
   game = new Chess(state.fen);
   board?.destroy();
-  board = Chessboard("board", {
+  board = createManagedBoard("board", {
     position: state.fen,
     orientation: humanColor,
     draggable: true,
@@ -369,6 +434,7 @@ function initializeBoard(state) {
     onDragStart,
     onDrop,
     onSnapEnd,
+    onSnapbackEnd,
     onMoveEnd: () => {
       applyHighlights();
       makeBoardAccessible();
@@ -688,6 +754,7 @@ async function startGame({ rematch = false, switchColor = false } = {}) {
     $("setup-panel").hidden = true;
     $("game-panel").hidden = false;
     gameOver = false;
+    gameSyncFailed = false;
     lastMoveCount = 0;
     clockAnnouncements.top.clear();
     clockAnnouncements.bottom.clear();
@@ -721,10 +788,14 @@ async function syncState() {
   try {
     handleState(await api("/state", { key: "game-state", timeout: 5000 }));
     pollFailures = 0;
+    gameSyncFailed = false;
     setConnected(true);
   } catch (error) {
     pollFailures += 1;
-    if (error.status !== 404) setConnected(false, error.message);
+    if (error.status !== 404) {
+      gameSyncFailed = true;
+      setConnected(false, error.message);
+    }
   }
   schedulePoll(Math.min(15000, 1000 * 2 ** pollFailures));
 }
@@ -854,6 +925,7 @@ function bindEvents() {
     }),
   );
   $("start-btn").addEventListener("click", () => startGame());
+  window.addEventListener("touchcancel", recoverCancelledBoardTouch);
   $("game-return-btn").addEventListener("click", returnToSetup);
   $("end-game-home-btn").addEventListener("click", endGameAndHome);
   $("analysis-return-btn").addEventListener("click", () => switchTab("play"));

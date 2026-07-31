@@ -96,6 +96,7 @@ _stockfish_probe_ok = STOCKFISH_READY
 LOCAL_GAMES_PATH = Path(os.environ.get("LOCAL_GAMES_PATH", "local_games.json"))
 MAX_SAVED_GAMES = 6
 _saved_games_lock = threading.Lock()
+ANALYSIS_RATE_LIMIT = max(30, int(os.environ.get("ANALYSIS_RATE_LIMIT", "200")))
 
 
 def _new_state(
@@ -184,12 +185,17 @@ def _request_guards():
         "new_game": (10, 60 * 60),
         "api_games": (20, 60),
         "api_local_games": (60, 60),
-        "api_eval": (30, 60),
-        "api_lines": (30, 60),
+        "api_eval": (ANALYSIS_RATE_LIMIT, 60),
+        "api_lines": (ANALYSIS_RATE_LIMIT, 60),
     }
     rule = limits.get(request.endpoint)
     if rule and not _rate_allowed(request.endpoint, *rule):
-        return jsonify({"error": "Rate limit exceeded."}), 429
+        response = jsonify({
+            "error": "Analysis is temporarily busy. Please wait a moment and retry."
+        })
+        response.status_code = 429
+        response.headers["Retry-After"] = "2"
+        return response
 
 
 @app.after_request
