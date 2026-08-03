@@ -185,18 +185,23 @@ async function makeMove(from, to, animateBoard = true) {
   pendingMove = { version: submittedVersion, startedAt: performance.now() };
   if (animateBoard) board.position(game.fen(), true);
   clearSelection();
-  setBusy(true, "Submitting your move…");
+  setBusy(true, "Alan Dai is thinking…");
+  $("status").textContent = "Alan Dai is thinking";
+  announce("Alan Dai is thinking.");
   try {
     const data = await post(
       "/move",
       {
         uci: move.from + move.to + (move.promotion || ""),
         expected_version: serverVersion,
+        start_bot: true,
       },
       { timeout: 10000 },
     );
     handleState(data, move);
-    if (!data.over && data.turn === botColor) await requestBotMove();
+    if (!data.over && data.turn === botColor && !data.bot_busy)
+      await requestBotMove();
+    else if (data.bot_busy) setBusy(false);
   } catch (error) {
     const uncertain = !error.status || error.status >= 500;
     if (uncertain) {
@@ -208,7 +213,9 @@ async function makeMove(from, to, animateBoard = true) {
         });
         if (state.version > submittedVersion) {
           handleState(state, move);
-          if (!state.over && state.turn === botColor) await requestBotMove();
+          if (!state.over && state.turn === botColor && !state.bot_busy)
+            await requestBotMove();
+          else if (state.bot_busy) setBusy(false);
           return true;
         }
         // The write may still be completing even though the follow-up read saw

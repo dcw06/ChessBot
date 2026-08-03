@@ -791,7 +791,7 @@ def end_game():
 def human_move():
     data = _request_data()
     uci = data.get("uci", "")
-    _, s, error = _game_or_error()
+    token, s, error = _game_or_error()
     if error:
         return error
     with s["lock"]:
@@ -824,6 +824,13 @@ def human_move():
         s["last_move"] = [move.from_square, move.to_square]
         s["version"] += 1
         _check_game_over(s)
+        if (
+            data.get("start_bot") is True
+            and not s["over"]
+            and board.turn == s["bot_color"]
+        ):
+            s["bot_busy"] = True
+            _start_bot_worker(token, s, s["version"])
         return jsonify(_board_json(s))
 
 

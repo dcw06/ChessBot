@@ -275,6 +275,19 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(undone.get_json()["moves"], [])
         self.assertEqual(undone.get_json()["fen"], chess.Board().fen())
 
+    def test_human_move_can_start_bot_without_second_request(self):
+        client = web_app.app.test_client()
+        self._new_game(client, bot_color="black")
+        moved = client.post(
+            "/move",
+            json={"uci": "e2e4", "expected_version": 0, "start_bot": True},
+        )
+        self.assertEqual(moved.status_code, 200)
+        self.assertTrue(moved.get_json()["bot_busy"])
+        self.assertTrue(
+            self._wait_for(lambda: client.get("/state").get_json()["version"] == 2)
+        )
+
     def test_capacity_is_checked_before_engine_creation(self):
         client = web_app.app.test_client()
         with web_app._games_lock:
