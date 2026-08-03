@@ -20,7 +20,8 @@ RUN pip install --no-cache-dir --require-hashes -r requirements-runtime.lock
 COPY . .
 
 RUN useradd --create-home --uid 10001 chessbot \
-    && chown -R chessbot:chessbot /app
+    && mkdir -p /data \
+    && chown -R chessbot:chessbot /app /data
 USER chessbot
 
 RUN REQUIRE_STOCKFISH=1 python -m scripts.smoke_test

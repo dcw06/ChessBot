@@ -1,4 +1,4 @@
-import { api, CancelledRequest, cancelRequest, post } from "./api.js";
+import { ApiError, api, CancelledRequest, cancelRequest, post } from "./api.js";
 import { playSound, setSoundEnabled, soundEnabled } from "./sounds.js";
 import { classifyResult, formatClock } from "./chess-utils.js";
 import { createManagedBoard } from "./managed-board.js";
@@ -38,6 +38,7 @@ let clockTimer;
 let pollFailures = 0;
 let gameOver = true;
 let requestBusy = false;
+let pendingMove = null;
 let selectedSquare = null;
 let suppressStationaryDropClick = false;
 let liveDragActive = false;
@@ -45,6 +46,7 @@ let gameSyncFailed = false;
 let lastState = null;
 let lastMoveCount = 0;
 let lastEvaluatedVersion = -1;
+let liveEvaluationUnavailableNotified = false;
 let clocks = { bot: 180, human: 180, at: performance.now(), turn: "white" };
 const clockAnnouncements = { top: new Set(), bottom: new Set() };
 let analysisModule;
@@ -99,13 +101,16 @@ async function refreshHealth() {
     $("stockfish-chip").textContent =
       `Stockfish ${data.stockfish || "unavailable"}`;
     $("stockfish-chip").className = "status-chip error";
-    setConnected(
-      false,
-      error.status === 503
-        ? "Services are temporarily unavailable. Retry shortly."
-        : error.message,
-    );
-    if (error.status === 503) $("connection-label").textContent = "Maintenance";
+    // An HTTP 503 readiness response proves that the web server is reachable.
+    // Stockfish is optional for gameplay, so report a degraded service without
+    // incorrectly replacing the connection state with "Offline".
+    if (error.status === 503 && data.status) {
+      setConnected(true);
+      $("connection-label").textContent =
+        data.model === "ready" ? "Degraded" : "Maintenance";
+      return;
+    }
+    setConnected(false, error.message);
   }
 }
 
@@ -171,10 +176,16 @@ async function makeMove(from, to, animateBoard = true) {
   }
   const move = game.move({ from, to, promotion });
   if (!move) return false;
+  // A state poll started before this move can otherwise arrive while the move
+  // request is in flight and redraw the pre-move position.  Cancel it before
+  // exposing the optimistic position and remember which server version the
+  // move is based on so an already-queued response cannot roll the board back.
+  cancelRequest("game-state");
+  const submittedVersion = serverVersion;
+  pendingMove = { version: submittedVersion, startedAt: performance.now() };
   if (animateBoard) board.position(game.fen(), true);
   clearSelection();
   setBusy(true, "Submitting your move…");
-  const submittedVersion = serverVersion;
   try {
     const data = await post(
       "/move",
@@ -200,8 +211,20 @@ async function makeMove(from, to, animateBoard = true) {
           if (!state.over && state.turn === botColor) await requestBotMove();
           return true;
         }
+        // The write may still be completing even though the follow-up read saw
+        // the old version.  Keep the optimistic piece in place and let polling
+        // reconcile it instead of visibly undoing a move that may be accepted.
+        gameSyncFailed = true;
+        pendingMove.startedAt = performance.now();
+        setConnected(
+          false,
+          "Move submitted, but confirmation is delayed. Reconnecting…",
+        );
+        schedulePoll(500);
+        return true;
       } catch {
         gameSyncFailed = true;
+        pendingMove.startedAt = performance.now();
         setConnected(
           false,
           "Move submitted, but confirmation is delayed. Reconnecting…",
@@ -210,6 +233,7 @@ async function makeMove(from, to, animateBoard = true) {
         return true;
       }
     }
+    pendingMove = null;
     game.undo();
     board.position(game.fen(), false);
     showError(error);
@@ -482,6 +506,18 @@ function soundForMove(move, state) {
 function handleState(state, localMove = null) {
   if (state.error) return showError({ message: state.error, data: state });
   if (Number.isInteger(state.version) && state.version < serverVersion) return;
+  if (
+    pendingMove &&
+    Number.isInteger(state.version) &&
+    state.version <= pendingMove.version
+  )
+    return;
+  if (
+    pendingMove &&
+    Number.isInteger(state.version) &&
+    state.version > pendingMove.version
+  )
+    pendingMove = null;
   const previousMoves = lastMoveCount;
   lastState = state;
   serverVersion = Number.isInteger(state.version)
@@ -549,8 +585,20 @@ async function updateLiveEvaluation(fen) {
       ? `M${Math.abs(data.mate)}`
       : `${data.cp >= 0 ? "+" : ""}${(data.cp / 100).toFixed(1)}`;
   } catch (error) {
-    if (!(error instanceof CancelledRequest))
-      toast("Live evaluation is unavailable.", "error");
+    if (error instanceof CancelledRequest) return;
+    if (error instanceof ApiError && error.status === 503) {
+      $("live-eval-toggle").checked = false;
+      $("live-eval-wrap").hidden = true;
+      $("live-eval-label").textContent = "Engine unavailable";
+      if (!liveEvaluationUnavailableNotified) {
+        liveEvaluationUnavailableNotified = true;
+        toast(
+          "Live evaluation requires Stockfish. Gameplay is still connected.",
+        );
+      }
+      return;
+    }
+    toast("Live evaluation is temporarily unavailable.", "error");
   }
 }
 
@@ -755,6 +803,7 @@ async function startGame({ rematch = false, switchColor = false } = {}) {
     $("game-panel").hidden = false;
     gameOver = false;
     gameSyncFailed = false;
+    pendingMove = null;
     lastMoveCount = 0;
     clockAnnouncements.top.clear();
     clockAnnouncements.bottom.clear();
@@ -785,19 +834,40 @@ function schedulePoll(delay) {
 }
 async function syncState() {
   if (gameOver || document.hidden) return;
+  if (requestBusy) {
+    schedulePoll(250);
+    return;
+  }
   try {
-    handleState(await api("/state", { key: "game-state", timeout: 5000 }));
+    const state = await api("/state", { key: "game-state", timeout: 5000 });
+    // If an uncertain submission never reached the server, eventually accept
+    // the unchanged authoritative position.  Until then, equal-version polls
+    // are stale with respect to the optimistic move and must not animate it
+    // backwards.
+    if (
+      pendingMove &&
+      Number.isInteger(state.version) &&
+      state.version <= pendingMove.version &&
+      performance.now() - pendingMove.startedAt >= 5000
+    )
+      pendingMove = null;
+    handleState(state);
     pollFailures = 0;
     gameSyncFailed = false;
     setConnected(true);
   } catch (error) {
+    if (error instanceof CancelledRequest) {
+      schedulePoll(250);
+      return;
+    }
     pollFailures += 1;
     if (error.status !== 404) {
       gameSyncFailed = true;
       setConnected(false, error.message);
     }
   }
-  schedulePoll(Math.min(15000, 1000 * 2 ** pollFailures));
+  const normalDelay = Math.min(15000, 1000 * 2 ** pollFailures);
+  schedulePoll(lastState?.bot_busy && !pollFailures ? 250 : normalDelay);
 }
 
 async function gameAction(path, confirmation) {
@@ -815,6 +885,7 @@ async function gameAction(path, confirmation) {
 async function switchTab(tab) {
   const analyze = tab === "analyze";
   if (!analyze) analysisModule?.deactivateAnalysis();
+  if (analyze) await getAnalysis();
   $("play-section").hidden = analyze;
   $("analyze-section").hidden = !analyze;
   document.querySelectorAll(".nav-tab").forEach((button) => {
@@ -823,7 +894,7 @@ async function switchTab(tab) {
     button.setAttribute("aria-selected", String(active));
     button.tabIndex = active ? 0 : -1;
   });
-  if (analyze) (await getAnalysis()).loadRecentGames();
+  if (analyze) analysisModule.loadRecentGames();
   resizeBoards();
 }
 
@@ -1013,6 +1084,7 @@ function bindEvents() {
   $("live-eval-toggle").addEventListener("change", (event) => {
     $("live-eval-wrap").hidden = !event.target.checked;
     if (event.target.checked && lastState) {
+      liveEvaluationUnavailableNotified = false;
       lastEvaluatedVersion = -1;
       updateLiveEvaluation(lastState.fen);
     }

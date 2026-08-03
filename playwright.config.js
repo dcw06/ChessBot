@@ -3,7 +3,11 @@ import { existsSync } from "node:fs";
 
 const python =
   process.env.PYTHON ??
-  (existsSync("venv/bin/python") ? "venv/bin/python" : "python");
+  (existsSync(".venv/Scripts/python.exe")
+    ? ".venv/Scripts/python.exe"
+    : existsSync(".venv/bin/python")
+      ? ".venv/bin/python"
+      : "python");
 
 export default defineConfig({
   testDir: "tests/frontend",
@@ -25,7 +29,13 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: `PORT=5010 COOKIE_SECURE=0 ${python} web_app.py`,
+    command: `"${python}" web_app.py`,
+    env: {
+      ...process.env,
+      CHESS_USERNAME: "yuandan",
+      COOKIE_SECURE: "0",
+      PORT: "5010",
+    },
     url: "http://127.0.0.1:5010/health/live",
     reuseExistingServer: true,
     timeout: 120000,

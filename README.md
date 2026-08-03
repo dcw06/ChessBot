@@ -21,11 +21,17 @@ python3.11 -m venv .venv
 
 Open <http://localhost:5001>. Set `STOCKFISH_PATH` if Stockfish is not on
 `PATH`. `MODEL_PATH`, `MODEL_MANIFEST_PATH`, `MODEL_RELEASE_PATH`, `BOOK_PATH`,
-`CHESS_USERNAME`, `PORT`, and `MAX_ACTIVE_GAMES` are also configurable.
+`CHESS_USERNAME`, `PORT`, `MAX_ACTIVE_GAMES`, `MAX_GAMES_PER_IP`,
+`GAME_IDLE_TTL`, `CAPACITY_EVICTION_IDLE`, and
+`MAX_ARTIFICIAL_THINK_DELAY` are also configurable. Bot replies include a
+human-like pause capped at two seconds by default; set the last value to `0`
+for immediate replies.
 
 The server gives each browser an opaque HttpOnly game cookie. Games are
 isolated in memory, so use one Gunicorn worker unless the state store is moved
-to a shared service. The default maximum is eight concurrent games.
+to a shared service. The default maximum is eight concurrent games and two
+active games per client IP. Idle games expire after 30 minutes; when the server
+is full, a game inactive for at least five minutes may be reclaimed.
 
 ## Verify
 

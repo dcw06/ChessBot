@@ -14,3 +14,4 @@ analyze_style*.py
 node_modules/
 test-results/
 playwright-report/
+localhost.*.log

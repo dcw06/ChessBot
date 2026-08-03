@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from dotenv import load_dotenv
 load_dotenv()
 import datetime
+import ipaddress
 import chess
 import chess.engine
 import chess.pgn
@@ -43,6 +44,13 @@ STOCKFISH_PATH   = (
     _sf_env if _sf_env and os.path.isfile(_sf_env)
     else shutil.which("stockfish") or "/usr/games/stockfish"
 )
+
+try:
+    MAX_ARTIFICIAL_THINK_DELAY = max(
+        0.0, float(os.environ.get("MAX_ARTIFICIAL_THINK_DELAY", "2.0"))
+    )
+except ValueError:
+    MAX_ARTIFICIAL_THINK_DELAY = 2.0
 
 try:
     MODEL_PATH, MANIFEST_PATH = map(
@@ -80,12 +88,15 @@ TIME_CONTROLS = {
 # client's game.
 GAME_COOKIE    = "chessbot_game"
 MAX_ACTIVE_GAMES = int(os.environ.get("MAX_ACTIVE_GAMES", "8"))
-GAME_IDLE_TTL = int(os.environ.get("GAME_IDLE_TTL", str(24 * 60 * 60)))
+MAX_GAMES_PER_IP = int(os.environ.get("MAX_GAMES_PER_IP", "2"))
+GAME_IDLE_TTL = int(os.environ.get("GAME_IDLE_TTL", str(30 * 60)))
+CAPACITY_EVICTION_IDLE = int(os.environ.get("CAPACITY_EVICTION_IDLE", str(5 * 60)))
 FINISHED_GAME_TTL = int(os.environ.get("FINISHED_GAME_TTL", str(15 * 60)))
 _games_lock    = threading.Lock()
 _analysis_lock = threading.Lock()
 _games: dict[str, dict] = {}
 _reserved_games = 0
+_reserved_by_owner: dict[str, int] = defaultdict(int)
 _creating_tokens: set[str] = set()
 _rate_lock = threading.Lock()
 _rate_events: dict[tuple[str, str], deque] = defaultdict(deque)
@@ -96,7 +107,7 @@ _stockfish_probe_ok = STOCKFISH_READY
 LOCAL_GAMES_PATH = Path(os.environ.get("LOCAL_GAMES_PATH", "local_games.json"))
 MAX_SAVED_GAMES = 6
 _saved_games_lock = threading.Lock()
-ANALYSIS_RATE_LIMIT = max(30, int(os.environ.get("ANALYSIS_RATE_LIMIT", "200")))
+ANALYSIS_RATE_LIMIT = max(10, int(os.environ.get("ANALYSIS_RATE_LIMIT", "30")))
 
 
 def _new_state(
@@ -143,6 +154,16 @@ def _new_state(
 def _request_data() -> dict:
     data = request.get_json(silent=True)
     return data if isinstance(data, dict) else {}
+
+
+def _client_owner() -> str:
+    forwarded = request.headers.get("CF-Connecting-IP", "").strip()
+    if forwarded:
+        try:
+            return str(ipaddress.ip_address(forwarded))
+        except ValueError:
+            pass
+    return request.remote_addr or "unknown"
 
 
 def _same_origin() -> bool:
@@ -261,6 +282,14 @@ def _prune_games():
             ]
             if finished:
                 token, _ = min(finished, key=lambda item: item[1]["last_access"])
+                removed.append(_games.pop(token))
+        if len(_games) >= MAX_ACTIVE_GAMES:
+            inactive = [
+                (token, game) for token, game in _games.items()
+                if now - game["last_access"] >= CAPACITY_EVICTION_IDLE
+            ]
+            if inactive:
+                token, _ = min(inactive, key=lambda item: item[1]["last_access"])
                 removed.append(_games.pop(token))
     for game in removed:
         with game["lock"]:
@@ -428,6 +457,14 @@ def _persist_finished_game(s: dict) -> None:
     s["saved"] = True
 
 
+def _try_persist_finished_game(s: dict) -> None:
+    """Keep gameplay available when optional local history cannot be written."""
+    try:
+        _persist_finished_game(s)
+    except Exception:
+        logger.exception("Unable to persist finished game")
+
+
 def _save_snapshot(s: dict):
     snapshots = s.setdefault("snapshots", [])
     snapshots.append({
@@ -475,7 +512,7 @@ def _check_game_over(s: dict):
     if s["human_clock"] <= 0:
         s["over"] = True
         s["result"] = "You flagged — Alan Dai wins on time!"
-    _persist_finished_game(s)
+    _try_persist_finished_game(s)
 
 
 # ── Analysis Stockfish (separate from the game engine) ────────────────────
@@ -522,25 +559,27 @@ def api_local_games():
 def api_eval():
     """Run Stockfish depth-15 on a FEN, return centipawn score from White's POV."""
     fen = _request_data().get("fen", "")
+    if not _analysis_lock.acquire(blocking=False):
+        return jsonify({"error": "Analysis is busy. Try again shortly."}), 429
     try:
-        with _analysis_lock:
-            sf = _get_analysis_sf()
-            if sf is None:
-                return jsonify({"error": "Stockfish unavailable"}), 500
-            board = chess.Board(fen)
-            if board.is_game_over():
-                return jsonify({"cp": 0, "is_mate": False, "mate": None})
-            info  = sf.analyse(board, chess.engine.Limit(depth=15))
-            score = info["score"].white()
-            if score.is_mate():
-                m = score.mate()
-                return jsonify({"cp": 10000 if m > 0 else -10000, "is_mate": True, "mate": m})
-            return jsonify({"cp": score.score(), "is_mate": False, "mate": None})
+        sf = _get_analysis_sf()
+        if sf is None:
+            return jsonify({"error": "Stockfish unavailable"}), 503
+        board = chess.Board(fen)
+        if board.is_game_over():
+            return jsonify({"cp": 0, "is_mate": False, "mate": None})
+        info = sf.analyse(board, chess.engine.Limit(depth=15))
+        score = info["score"].white()
+        if score.is_mate():
+            m = score.mate()
+            return jsonify({"cp": 10000 if m > 0 else -10000, "is_mate": True, "mate": m})
+        return jsonify({"cp": score.score(), "is_mate": False, "mate": None})
     except Exception:
         logger.exception("Position evaluation failed")
-        with _analysis_lock:
-            _discard_analysis_sf()
+        _discard_analysis_sf()
         return jsonify({"error": "Position evaluation failed."}), 500
+    finally:
+        _analysis_lock.release()
 
 
 
@@ -552,17 +591,18 @@ def api_lines():
     multipv = min(5, max(1, data.get("lines", 3))) if isinstance(data.get("lines", 3), int) else 3
     think_time = data.get("time", 0.3)
     think_time = min(2.0, max(0.05, float(think_time))) if isinstance(think_time, (int, float)) else 0.3
+    if not _analysis_lock.acquire(blocking=False):
+        return jsonify({"error": "Analysis is busy. Try again shortly."}), 429
     try:
-        with _analysis_lock:
-            sf = _get_analysis_sf()
-            if sf is None:
-                return jsonify({"error": "Stockfish unavailable"}), 500
-            board = chess.Board(fen)
-            if board.is_game_over():
-                return jsonify({"lines": []})
-            infos = sf.analyse(board, chess.engine.Limit(time=think_time), multipv=multipv)
-            if not isinstance(infos, list):
-                infos = [infos]
+        sf = _get_analysis_sf()
+        if sf is None:
+            return jsonify({"error": "Stockfish unavailable"}), 503
+        board = chess.Board(fen)
+        if board.is_game_over():
+            return jsonify({"lines": []})
+        infos = sf.analyse(board, chess.engine.Limit(time=think_time), multipv=multipv)
+        if not isinstance(infos, list):
+            infos = [infos]
 
         lines = []
         for info in infos:
@@ -590,9 +630,10 @@ def api_lines():
                         "depth": max((info.get("depth", 0) for info in infos), default=0)})
     except Exception:
         logger.exception("Line analysis failed")
-        with _analysis_lock:
-            _discard_analysis_sf()
+        _discard_analysis_sf()
         return jsonify({"error": "Line analysis failed."}), 500
+    finally:
+        _analysis_lock.release()
 
 
 
@@ -624,15 +665,24 @@ def new_game():
 
     _prune_games()
     old_token, old_game = _current_game()
+    owner = _client_owner()
     with _games_lock:
         if old_token in _creating_tokens:
             return jsonify({"error": "Game creation already in progress."}), 409
         if old_game is None and len(_games) + _reserved_games >= MAX_ACTIVE_GAMES:
             return jsonify({"error": "Server is at game capacity. Try again shortly."}), 503
+        owner_games = sum(
+            game.get("owner") == owner for game in _games.values()
+        ) + _reserved_by_owner.get(owner, 0)
+        if old_game is None and owner_games >= MAX_GAMES_PER_IP:
+            return jsonify({
+                "error": "Too many active games from this connection."
+            }), 429
         if old_token:
             _creating_tokens.add(old_token)
         if old_game is None:
             _reserved_games += 1
+            _reserved_by_owner[owner] += 1
     token = secrets.token_urlsafe(32)
     try:
         s = (
@@ -647,13 +697,20 @@ def new_game():
                 _creating_tokens.discard(old_token)
             if old_game is None:
                 _reserved_games -= 1
+                _reserved_by_owner[owner] -= 1
+                if not _reserved_by_owner[owner]:
+                    _reserved_by_owner.pop(owner, None)
         return jsonify({"error": "Chess engine is unavailable."}), 503
     s["is_rematch"] = is_rematch
+    s["owner"] = owner
     with _games_lock:
         if old_token:
             _creating_tokens.discard(old_token)
         if old_game is None:
             _reserved_games -= 1
+            _reserved_by_owner[owner] -= 1
+            if not _reserved_by_owner[owner]:
+                _reserved_by_owner.pop(owner, None)
         _games[token] = s
         if old_token:
             _games.pop(old_token, None)
@@ -662,8 +719,11 @@ def new_game():
             old_game["over"] = True
             old_game["result"] = old_game.get("result") or "Game replaced."
             old_game["version"] += 1
-            _persist_finished_game(old_game)
-            old_game["engine"].close()
+            _try_persist_finished_game(old_game)
+            try:
+                old_game["engine"].close()
+            except Exception:
+                logger.exception("Unable to close replaced game engine")
 
     response = jsonify(_board_json(s))
     response.set_cookie(
@@ -685,7 +745,7 @@ def resign():
         s["over"] = True
         s["result"] = "You resigned — Alan Dai wins!"
         s["version"] += 1
-        _persist_finished_game(s)
+        _try_persist_finished_game(s)
         return jsonify(_board_json(s))
 
 
@@ -703,7 +763,7 @@ def abort():
         s["over"] = True
         s["result"] = "Game aborted."
         s["version"] += 1
-        _persist_finished_game(s)
+        _try_persist_finished_game(s)
         return jsonify(_board_json(s))
 
 
@@ -767,10 +827,67 @@ def human_move():
         return jsonify(_board_json(s))
 
 
+def _finish_bot_move(token: str, s: dict, start_version: int) -> None:
+    engine: ChessBotEngine = s["engine"]
+    try:
+        with s["lock"]:
+            board = s["board"].copy(stack=True)
+            clock = s["bot_clock"]
+            is_rematch = s["is_rematch"]
+            move = engine.get_move(board, clock, is_rematch=is_rematch)
+            think_delay = s["think_timer"].get_delay(
+                board,
+                engine.last_gap_cp,
+                move,
+                clock,
+                from_book=engine.last_from_book,
+            )
+            think_delay = min(think_delay, MAX_ARTIFICIAL_THINK_DELAY)
+        time.sleep(think_delay)
+    except Exception:
+        logger.exception("Bot move calculation failed")
+        with s["lock"]:
+            s["bot_busy"] = False
+        return
+
+    with _games_lock:
+        current = _games.get(token)
+    with s["lock"]:
+        s["bot_busy"] = False
+        if current is not s or s["version"] != start_version:
+            return
+        if s.get("over"):
+            return
+        if move not in s["board"].legal_moves:
+            logger.error("Calculated bot move became illegal: %s", move)
+            return
+        _tick_clock(s)
+        _check_game_over(s)
+        if s["over"]:
+            return
+        san = s["board"].san(move)
+        _save_snapshot(s)
+        s["board"].push(move)
+        s["bot_clock"] += s.get("increment", 0)
+        s["moves"].append(san)
+        s["last_move"] = [move.from_square, move.to_square]
+        s["version"] += 1
+        s["decision_source"] = getattr(engine, "last_decision_source", "chess engine")
+        _check_game_over(s)
+
+
+def _start_bot_worker(token: str, s: dict, start_version: int) -> None:
+    worker = threading.Thread(
+        target=_finish_bot_move,
+        args=(token, s, start_version),
+        name=f"chessbot-move-{token[:8]}",
+        daemon=True,
+    )
+    worker.start()
+
+
 @app.route("/bot_move", methods=["POST"])
 def bot_move():
-    # Phase 1: compute the move quickly, then release the lock so the UI
-    # can keep polling /state (and ticking the clock) during the think delay.
     data = _request_data()
     token, s, error = _game_or_error()
     if error:
@@ -785,56 +902,14 @@ def bot_move():
         board: chess.Board = s["board"]
         if board.turn != s["bot_color"]:
             return jsonify({"error": "Not bot's turn."}), 409
-
-        _tick_clock(s)
-        start_version = s["version"]
-        s["bot_busy"] = True
-        engine: ChessBotEngine = s["engine"]
-        try:
-            move = engine.get_move(board, s["bot_clock"],
-                                   is_rematch=s["is_rematch"])
-        except Exception:
-            s["bot_busy"] = False
-            logger.exception("Bot move calculation failed")
-            return jsonify({"error": "Chess engine failed to calculate a move."}), 503
-        think_delay = s["think_timer"].get_delay(
-            board,
-            engine.last_gap_cp,
-            move,
-            s["bot_clock"],
-            from_book=engine.last_from_book,
-        )
-
-    # Phase 2: simulate thinking — lock released so /state stays responsive
-    # and _tick_clock() in get_state() naturally deducts time from bot's clock.
-    time.sleep(think_delay)
-
-    # Phase 3: apply the move.
-    with _games_lock:
-        current = _games.get(token)
-    with s["lock"]:
-        s["bot_busy"] = False
-        if current is not s or s["version"] != start_version:
-            return jsonify({"error": "Position changed; bot move discarded."}), 409
-        if s.get("over"):
-            return jsonify(_board_json(s))
-        if move not in s["board"].legal_moves:
-            logger.error("Calculated bot move became illegal: %s", move)
-            return jsonify({"error": "Calculated move is no longer legal."}), 409
         _tick_clock(s)
         _check_game_over(s)
         if s["over"]:
             return jsonify(_board_json(s))
-        san = s["board"].san(move)
-        _save_snapshot(s)
-        s["board"].push(move)
-        s["bot_clock"] += s.get("increment", 0)
-        s["moves"].append(san)
-        s["last_move"] = [move.from_square, move.to_square]
-        s["version"] += 1
-        s["decision_source"] = getattr(engine, "last_decision_source", "chess engine")
-        _check_game_over(s)
-        return jsonify(_board_json(s))
+        start_version = s["version"]
+        s["bot_busy"] = True
+        _start_bot_worker(token, s, start_version)
+        return jsonify(_board_json(s)), 202
 
 
 @app.route("/undo", methods=["POST"])

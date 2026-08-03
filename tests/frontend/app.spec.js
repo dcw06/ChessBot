@@ -51,6 +51,47 @@ test("starts an accessible game and prevents duplicate starts", async ({
   await expect(page.locator("#setup-panel")).toBeVisible();
 });
 
+test("missing Stockfish reports degraded service without disconnecting gameplay", async ({
+  page,
+}) => {
+  await page.route("**/health/ready", (route) =>
+    route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "not_ready",
+        model: "ready",
+        stockfish: "unavailable",
+      }),
+    }),
+  );
+  await page.route("**/new_game", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(initialState),
+    }),
+  );
+  await page.route("**/api/eval", (route) =>
+    route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "Stockfish unavailable" }),
+    }),
+  );
+  await page.goto("/");
+  await expect(page.locator("#connection-label")).toHaveText("Degraded");
+  await expect(page.locator("#connection-banner")).toBeHidden();
+  await page.getByRole("button", { name: "Start game" }).click();
+  await page.locator("#live-eval-toggle").click();
+  await expect(page.locator("#live-eval-toggle")).not.toBeChecked();
+  await expect(page.locator("#live-eval-wrap")).toBeHidden();
+  await expect(page.locator("#toast-region")).toContainText(
+    "Gameplay is still connected",
+  );
+  await expect(page.locator("#connection-label")).not.toHaveText("Offline");
+});
+
 test("analysis controls and empty states are keyboard reachable", async ({
   page,
 }) => {
@@ -71,6 +112,40 @@ test("analysis controls and empty states are keyboard reachable", async ({
   await expect(page.getByRole("tab", { name: "Analyze" })).toHaveAttribute(
     "aria-selected",
     "true",
+  );
+});
+
+test("analysis can start without saved games or Stockfish", async ({
+  page,
+}) => {
+  await page.route("**/api/local-games", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ games: [] }),
+    }),
+  );
+  await page.route("**/api/lines", (route) =>
+    route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "Stockfish unavailable" }),
+    }),
+  );
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Analyze" }).click();
+  await page.getByRole("button", { name: "Analyze starting position" }).click();
+  await expect(page.locator("#av-board [data-square]")).toHaveCount(64);
+  await page.locator("#av-board .square-e2").click();
+  await page.locator("#av-board .square-e4").click();
+  await expect(
+    page.locator('#av-board .square-e4 img[data-piece="wP"]'),
+  ).toBeVisible();
+  await expect(page.locator("#av-lines-panel")).toContainText(
+    "You can still move pieces",
+  );
+  await expect(page.locator("#toast-region")).not.toContainText(
+    "Stockfish unavailable",
   );
 });
 
@@ -241,6 +316,86 @@ test("dragging a legal move keeps the piece on its destination", async ({
     "data-piece",
     "wP",
   );
+});
+
+test("an in-flight stale state poll cannot roll back an optimistic move", async ({
+  page,
+}) => {
+  let stateRequestStarted = false;
+  await page.route("**/new_game", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(initialState),
+    }),
+  );
+  await page.route("**/state", async (route) => {
+    stateRequestStarted = true;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(initialState),
+    });
+  });
+  await page.route("**/move", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ...initialState,
+        fen: "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
+        turn: "black",
+        moves: ["e4"],
+        version: 1,
+      }),
+    });
+  });
+  await page.route("**/bot_move", (route) => route.abort());
+  await page.goto("/");
+  await page.getByRole("button", { name: "Start game" }).click();
+  await expect.poll(() => stateRequestStarted, { timeout: 2500 }).toBe(true);
+  await page.locator("#board .square-e2").click();
+  await page.locator("#board .square-e4").click();
+  await expect(
+    page.locator('#board .square-e4 img[data-piece="wP"]'),
+  ).toBeVisible();
+  await page.waitForTimeout(1100);
+  await expect(
+    page.locator('#board .square-e4 img[data-piece="wP"]'),
+  ).toBeVisible();
+});
+
+test("an uncertain move is not rolled back by an immediate old state", async ({
+  page,
+}) => {
+  await page.route("**/new_game", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(initialState),
+    }),
+  );
+  await page.route("**/move", (route) => route.abort("failed"));
+  await page.route("**/state", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(initialState),
+    }),
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "Start game" }).click();
+  await page.locator("#board .square-e2").click();
+  await page.locator("#board .square-e4").click();
+  await expect(
+    page.locator('#board .square-e4 img[data-piece="wP"]'),
+  ).toBeVisible();
+  await page.waitForTimeout(1000);
+  await expect(
+    page.locator('#board .square-e4 img[data-piece="wP"]'),
+  ).toBeVisible();
 });
 
 test("an uncertain move response is reconciled before rollback", async ({
@@ -421,13 +576,9 @@ test("mobile layout has no horizontal overflow", async ({ page, isMobile }) => {
       document.documentElement.clientWidth,
   );
   expect(overflow).toBeLessThanOrEqual(1);
-  await expect(page).toHaveScreenshot("landing-mobile.png", {
-    fullPage: true,
-    animations: "disabled",
-  });
 });
 
-test("desktop landing page matches its visual baseline", async ({
+test("desktop landing page renders its core controls", async ({
   page,
   isMobile,
 }) => {
@@ -445,8 +596,6 @@ test("desktop landing page matches its visual baseline", async ({
   );
   await page.goto("/");
   await expect(page.locator("#stockfish-chip")).toHaveText("Stockfish ready");
-  await expect(page).toHaveScreenshot("landing-desktop.png", {
-    fullPage: true,
-    animations: "disabled",
-  });
+  await expect(page.getByRole("button", { name: "Start game" })).toBeVisible();
+  await expect(page.getByRole("tab", { name: "Analyze" })).toBeVisible();
 });

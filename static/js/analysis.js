@@ -32,7 +32,6 @@ let debounce;
 let lastAnalysisRequestAt = 0;
 const ANALYSIS_DEBOUNCE_MS = 50;
 const ANALYSIS_MIN_INTERVAL_MS = 300;
-const ANALYSIS_CLICK_DELAY_MS = 80;
 const evaluations = new Map();
 let analysisGeneration = 0;
 let returnIndex = 0;
@@ -40,7 +39,9 @@ let sourcePgn = "";
 let analysisModified = false;
 let analysisSelected = null;
 let analysisDragActive = false;
+let suppressStationaryAnalysisClick = false;
 let analysisOrientation = "white";
+let engineUnavailable = false;
 
 function button(label, className = "button secondary") {
   const element = document.createElement("button");
@@ -92,10 +93,11 @@ function renderGames() {
     detail.textContent = games.length
       ? "Try clearing one of the filters."
       : "Complete a game against Alan Dai to see it here.";
-    empty.append(title, detail, button("Import PGN", "button primary"));
-    empty.lastElementChild.addEventListener("click", () =>
-      $("import-pgn-btn").click(),
-    );
+    const start = button("Analyze starting position", "button primary");
+    start.addEventListener("click", openStartingPosition);
+    const importPgn = button("Import PGN");
+    importPgn.addEventListener("click", () => $("import-pgn-btn").click());
+    empty.append(title, detail, start, importPgn);
     container.append(empty);
     return;
   }
@@ -231,7 +233,10 @@ function saveBranch(index, moves) {
 function onDrop(from, to) {
   analysisDragActive = false;
   if (from === to) {
-    setTimeout(() => activateAnalysisSquare(from), ANALYSIS_CLICK_DELAY_MS);
+    suppressStationaryAnalysisClick = true;
+    setTimeout(() => {
+      suppressStationaryAnalysisClick = false;
+    }, 0);
     return "snapback";
   }
   clearAnalysisSelection();
@@ -352,13 +357,14 @@ function makeAnalysisBoardAccessible(focusSquare = "e2") {
 }
 
 function analysisEmptySquareClick(event) {
+  if (suppressStationaryAnalysisClick) {
+    suppressStationaryAnalysisClick = false;
+    return;
+  }
   const square =
     event.currentTarget.className.match(/square-([a-h][1-8])/)?.[1];
   if (!square) return;
-  // Pieces belonging to the moving side are handled by onDrop because they
-  // start a drag. Empty squares and opposing pieces receive a regular click.
-  if (viewer.get(square)?.color !== viewer.turn())
-    activateAnalysisSquare(square);
+  activateAnalysisSquare(square);
 }
 
 function analysisBoardKeydown(event) {
@@ -470,6 +476,10 @@ export function openGame(game) {
 
 function scheduleAnalysis() {
   clearTimeout(debounce);
+  if (engineUnavailable) {
+    renderEngineUnavailable();
+    return;
+  }
   debounce = setTimeout(analyzePosition, ANALYSIS_DEBOUNCE_MS);
 }
 
@@ -517,6 +527,11 @@ async function analyzePosition() {
     });
     renderMoveTree();
   } catch (error) {
+    if (error instanceof ApiError && error.status === 503) {
+      engineUnavailable = true;
+      renderEngineUnavailable();
+      return;
+    }
     if (
       !(error instanceof CancelledRequest) &&
       !(error instanceof ApiError && error.status === 429)
@@ -530,6 +545,22 @@ async function analyzePosition() {
   } finally {
     if (generation === analysisGeneration) $("analysis-progress").hidden = true;
   }
+}
+
+function renderEngineUnavailable() {
+  const panel = $("av-lines-panel");
+  panel.replaceChildren();
+  const meta = document.createElement("div");
+  meta.className = "engine-meta";
+  meta.textContent =
+    "Stockfish is unavailable. You can still move pieces and explore variations.";
+  const retry = button("Retry engine", "button secondary small");
+  retry.addEventListener("click", () => {
+    engineUnavailable = false;
+    scheduleAnalysis();
+  });
+  panel.append(meta, retry);
+  $("av-eval-label").textContent = "Engine unavailable";
 }
 
 function renderLines(lines, depth) {
@@ -619,6 +650,29 @@ function importText(kind) {
     },
     { once: true },
   );
+}
+
+function openStartingPosition() {
+  mainMoves = [];
+  mainIndex = 0;
+  returnIndex = 0;
+  viewer = new Chess();
+  variation = [];
+  branches.clear();
+  evaluations.clear();
+  sourcePgn = "";
+  analysisModified = true;
+  $("recent-games-panel").hidden = true;
+  $("av-game-view").hidden = false;
+  setAnalysisContext(true);
+  initializeBoard();
+  $("av-game-title").textContent = "Starting position";
+  $("av-top-name").textContent = "Black";
+  $("av-bottom-name").textContent = "White";
+  $("av-top-sub").textContent = "Black";
+  $("av-bottom-sub").textContent = "White";
+  renderMoveTree();
+  scheduleAnalysis();
 }
 
 function download(name, contents, type = "text/plain") {

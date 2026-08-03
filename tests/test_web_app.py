@@ -98,6 +98,8 @@ class WebAppTests(unittest.TestCase):
         self.new_state = self.new_state_patcher.start()
         with web_app._games_lock:
             web_app._games.clear()
+            web_app._reserved_by_owner.clear()
+            web_app._reserved_games = 0
         with web_app._rate_lock:
             web_app._rate_events.clear()
 
@@ -107,6 +109,8 @@ class WebAppTests(unittest.TestCase):
         self.temp_directory.cleanup()
         with web_app._games_lock:
             web_app._games.clear()
+            web_app._reserved_by_owner.clear()
+            web_app._reserved_games = 0
 
     def _new_game(self, client, bot_color="black"):
         response = client.post(
@@ -120,6 +124,20 @@ class WebAppTests(unittest.TestCase):
         cookie = source.get_cookie(web_app.GAME_COOKIE)
         self.assertIsNotNone(cookie)
         target.set_cookie(web_app.GAME_COOKIE, cookie.value)
+
+    def _client_state(self, client):
+        cookie = client.get_cookie(web_app.GAME_COOKIE)
+        self.assertIsNotNone(cookie)
+        with web_app._games_lock:
+            return web_app._games[cookie.value]
+
+    def _wait_for(self, predicate, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
 
     def test_clients_cannot_access_or_replace_each_others_games(self):
         first = web_app.app.test_client()
@@ -153,6 +171,33 @@ class WebAppTests(unittest.TestCase):
             len(client.get("/api/local-games").get_json()["games"]), before
         )
         self.assertFalse(client.post("/end_game").get_json()["ended"])
+
+    def test_resign_succeeds_when_game_history_cannot_be_written(self):
+        client = web_app.app.test_client()
+        self._new_game(client)
+        state = self._client_state(client)
+        state["moves"] = ["e4"]
+        with mock.patch.object(
+            web_app, "_persist_finished_game", side_effect=PermissionError("read-only")
+        ):
+            response = client.post("/resign")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["over"])
+
+    def test_replacing_game_succeeds_when_history_cannot_be_written(self):
+        client = web_app.app.test_client()
+        self._new_game(client)
+        state = self._client_state(client)
+        state["moves"] = ["e4"]
+        with mock.patch.object(
+            web_app, "_persist_finished_game", side_effect=PermissionError("read-only")
+        ):
+            response = client.post(
+                "/new_game",
+                json={"tc": "blitz", "bot_color": "black", "is_rematch": False},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.get_json()["over"])
 
     def test_cross_origin_mutation_is_rejected(self):
         client = web_app.app.test_client()
@@ -221,7 +266,10 @@ class WebAppTests(unittest.TestCase):
         bot = client.post(
             "/bot_move", json={"expected_version": moved.get_json()["version"]}
         )
-        self.assertEqual(bot.status_code, 200)
+        self.assertEqual(bot.status_code, 202)
+        self.assertTrue(
+            self._wait_for(lambda: client.get("/state").get_json()["version"] == 2)
+        )
         undone = client.post("/undo")
         self.assertEqual(undone.status_code, 200)
         self.assertEqual(undone.get_json()["moves"], [])
@@ -238,6 +286,64 @@ class WebAppTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 503)
         self.assertEqual(self.new_state.call_count, before)
+
+    def test_per_ip_game_limit_is_enforced(self):
+        clients = [web_app.app.test_client() for _ in range(web_app.MAX_GAMES_PER_IP + 1)]
+        for client in clients[:web_app.MAX_GAMES_PER_IP]:
+            self.assertEqual(
+                client.post(
+                    "/new_game",
+                    json={"tc": "blitz", "bot_color": "black"},
+                    environ_base={"REMOTE_ADDR": "203.0.113.10"},
+                ).status_code,
+                200,
+            )
+        limited = clients[-1].post(
+            "/new_game",
+            json={"tc": "blitz", "bot_color": "black"},
+            environ_base={"REMOTE_ADDR": "203.0.113.10"},
+        )
+        self.assertEqual(limited.status_code, 429)
+
+    def test_cloudflare_client_ip_separates_visitors(self):
+        clients = [web_app.app.test_client() for _ in range(2)]
+        for index, client in enumerate(clients, start=10):
+            response = client.post(
+                "/new_game",
+                json={"tc": "blitz", "bot_color": "black"},
+                headers={"CF-Connecting-IP": f"203.0.113.{index}"},
+                environ_base={"REMOTE_ADDR": "198.51.100.1"},
+            )
+            self.assertEqual(response.status_code, 200)
+        with web_app._games_lock:
+            self.assertEqual(
+                {game["owner"] for game in web_app._games.values()},
+                {"203.0.113.10", "203.0.113.11"},
+            )
+
+    def test_capacity_pruning_evicts_only_sufficiently_inactive_game(self):
+        now = time.monotonic()
+        with web_app._games_lock:
+            for index in range(web_app.MAX_ACTIVE_GAMES):
+                state = fake_state("blitz", "black")
+                state["last_access"] = now
+                web_app._games[f"active-{index}"] = state
+            web_app._games["active-0"]["last_access"] = (
+                now - web_app.CAPACITY_EVICTION_IDLE - 1
+            )
+        web_app._prune_games()
+        with web_app._games_lock:
+            self.assertEqual(len(web_app._games), web_app.MAX_ACTIVE_GAMES - 1)
+            self.assertNotIn("active-0", web_app._games)
+
+    def test_analysis_contention_returns_immediately(self):
+        client = web_app.app.test_client()
+        web_app._analysis_lock.acquire()
+        try:
+            response = client.post("/api/eval", json={"fen": chess.STARTING_FEN})
+        finally:
+            web_app._analysis_lock.release()
+        self.assertEqual(response.status_code, 429)
 
     def test_duplicate_bot_move_is_rejected(self):
         first = web_app.app.test_client()
@@ -258,22 +364,49 @@ class WebAppTests(unittest.TestCase):
             )
 
         with mock.patch.object(web_app.time, "sleep", side_effect=delayed_sleep):
-            worker = threading.Thread(target=run_first)
-            worker.start()
+            run_first()
             self.assertTrue(entered.wait(1))
             response = duplicate.post("/bot_move", json={"expected_version": 0})
             self.assertEqual(response.status_code, 409)
             self.assertEqual(response.get_json()["error"], "Bot move already in progress.")
             release.set()
-            worker.join(2)
 
-        self.assertEqual(result["response"].status_code, 200)
-        self.assertEqual(len(result["response"].get_json()["moves"]), 1)
+        self.assertEqual(result["response"].status_code, 202)
+        self.assertTrue(
+            self._wait_for(lambda: first.get("/state").get_json()["version"] == 1)
+        )
+
+    def test_bot_artificial_delay_is_capped(self):
+        client = web_app.app.test_client()
+        self._new_game(client, bot_color="white")
+        cookie = client.get_cookie(web_app.GAME_COOKIE)
+        with web_app._games_lock:
+            state = web_app._games[cookie.value]
+        state["think_timer"] = mock.Mock()
+        state["think_timer"].get_delay.return_value = 30.0
+        observed = []
+        delay_observed = threading.Event()
+
+        def record_sleep(delay):
+            observed.append(delay)
+            if delay == web_app.MAX_ARTIFICIAL_THINK_DELAY:
+                delay_observed.set()
+
+        with mock.patch.object(web_app.time, "sleep", side_effect=record_sleep):
+            response = client.post("/bot_move", json={"expected_version": 0})
+            self.assertEqual(response.status_code, 202)
+            self.assertTrue(delay_observed.wait(1))
+            self.assertTrue(self._wait_for(lambda: not state["bot_busy"]))
+
+        self.assertIn(web_app.MAX_ARTIFICIAL_THINK_DELAY, observed)
 
     def test_new_game_invalidates_pending_bot_move(self):
         first = web_app.app.test_client()
         replacement = web_app.app.test_client()
         self._new_game(first, bot_color="white")
+        cookie = first.get_cookie(web_app.GAME_COOKIE)
+        with web_app._games_lock:
+            old_state = web_app._games[cookie.value]
         self._copy_game_cookie(first, replacement)
         entered = threading.Event()
         release = threading.Event()
@@ -289,15 +422,14 @@ class WebAppTests(unittest.TestCase):
             )
 
         with mock.patch.object(web_app.time, "sleep", side_effect=delayed_sleep):
-            worker = threading.Thread(target=run_old_move)
-            worker.start()
+            run_old_move()
             self.assertTrue(entered.wait(1))
             self._new_game(replacement, bot_color="black")
             release.set()
-            worker.join(2)
 
-        self.assertEqual(result["response"].status_code, 409)
-        self.assertIn("discarded", result["response"].get_json()["error"])
+        self.assertEqual(result["response"].status_code, 202)
+        self.assertTrue(self._wait_for(lambda: not old_state["bot_busy"]))
+        self.assertEqual(replacement.get("/state").get_json()["moves"], [])
 
     def test_game_over_and_clock_outcomes(self):
         checkmate = fake_state("blitz", "black")
