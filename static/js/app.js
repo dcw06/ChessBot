@@ -163,7 +163,12 @@ function choosePromotion() {
   );
 }
 
-async function makeMove(from, to, animateBoard = true) {
+async function makeMove(
+  from,
+  to,
+  animateBoard = true,
+  boardAlreadyMoved = false,
+) {
   if (requestBusy || gameOver || game.turn() !== humanColor[0]) return false;
   const piece = game.get(from);
   let promotion = "q";
@@ -183,7 +188,7 @@ async function makeMove(from, to, animateBoard = true) {
   cancelRequest("game-state");
   const submittedVersion = serverVersion;
   pendingMove = { version: submittedVersion, startedAt: performance.now() };
-  if (animateBoard) board.position(game.fen(), true);
+  if (!boardAlreadyMoved) board.position(game.fen(), animateBoard);
   clearSelection();
   setBusy(true, "Alan Dai is thinking…");
   $("status").textContent = "Alan Dai is thinking";
@@ -281,10 +286,10 @@ function onDrop(from, to) {
   clearSelection();
   const isPromotion = candidate.flags.includes("p");
   if (isPromotion) {
-    window.queueMicrotask(() => makeMove(from, to));
+    window.queueMicrotask(() => makeMove(from, to, false));
     return "snapback";
   }
-  makeMove(from, to, false);
+  makeMove(from, to, false, true);
   return undefined;
 }
 function onSnapEnd() {
@@ -332,7 +337,7 @@ function activateSquare(square) {
     if (piece?.color === humanColor[0]) return selectSquare(square);
     const from = selectedSquare;
     clearSelection();
-    makeMove(from, square);
+    makeMove(from, square, false);
   } else if (piece?.color === humanColor[0]) selectSquare(square);
 }
 
@@ -539,7 +544,9 @@ function handleState(state, localMove = null) {
     replay.fen().split(" ").slice(0, 4).join(" ") ===
       state.fen.split(" ").slice(0, 4).join(" ");
   game = samePosition ? replay : new Chess(state.fen);
-  board?.position(state.fen, true);
+  // A response that confirms the move already rendered optimistically should
+  // not animate the same piece a second time.
+  board?.position(state.fen, !localMove);
   applyHighlights();
   updateClocks(state);
   renderMoveList(state.moves || []);
