@@ -46,10 +46,9 @@ export async function api(path, options = {}) {
       );
     return data;
   } catch (error) {
-    if (
-      error.name === "AbortError" &&
-      controller.signal.reason === "superseded"
-    )
+    // A custom abort reason is not consistently surfaced as AbortError.
+    // Inspect the signal so intentional cancellation is not shown as an outage.
+    if (controller.signal.aborted && controller.signal.reason === "superseded")
       throw new CancelledRequest();
     if (retries > 0 && !(error instanceof ApiError && error.status < 500)) {
       await new Promise((resolve) =>
@@ -61,7 +60,10 @@ export async function api(path, options = {}) {
         _attempt: (options._attempt || 0) + 1,
       });
     }
-    if (error.name === "AbortError")
+    if (
+      (controller.signal.aborted && controller.signal.reason === "timeout") ||
+      error.name === "AbortError"
+    )
       throw new ApiError("The request took too long. Please try again.");
     throw error instanceof ApiError
       ? error

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { api, CancelledRequest } from "../../static/js/api.js";
 import {
   classifyResult,
   classifyMoveQuality,
@@ -32,4 +33,32 @@ test("evaluation percentage remains bounded", () => {
   assert.equal(evaluationPercent(100000), 97);
   assert.equal(evaluationPercent(-100000), 3);
   assert.equal(evaluationPercent(1, true), 100);
+});
+
+test("superseded requests are classified as cancellations", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = (_path, options) => {
+    requestCount += 1;
+    if (requestCount === 2)
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true }),
+      });
+    return new Promise((_resolve, reject) => {
+      options.signal.addEventListener("abort", () =>
+        reject(options.signal.reason),
+      );
+    });
+  };
+
+  try {
+    const superseded = api("/state", { key: "state-test" });
+    const replacement = api("/state", { key: "state-test" });
+    await assert.rejects(superseded, CancelledRequest);
+    assert.deepEqual(await replacement, { ok: true });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
