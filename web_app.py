@@ -47,10 +47,10 @@ STOCKFISH_PATH   = (
 
 try:
     MAX_ARTIFICIAL_THINK_DELAY = max(
-        0.0, float(os.environ.get("MAX_ARTIFICIAL_THINK_DELAY", "2.0"))
+        0.0, float(os.environ.get("MAX_ARTIFICIAL_THINK_DELAY", "0"))
     )
 except ValueError:
-    MAX_ARTIFICIAL_THINK_DELAY = 2.0
+    MAX_ARTIFICIAL_THINK_DELAY = 0.0
 
 try:
     MODEL_PATH, MANIFEST_PATH = map(
@@ -842,15 +842,19 @@ def _finish_bot_move(token: str, s: dict, start_version: int) -> None:
             clock = s["bot_clock"]
             is_rematch = s["is_rematch"]
             move = engine.get_move(board, clock, is_rematch=is_rematch)
-            think_delay = s["think_timer"].get_delay(
-                board,
-                engine.last_gap_cp,
-                move,
-                clock,
-                from_book=engine.last_from_book,
-            )
-            think_delay = min(think_delay, MAX_ARTIFICIAL_THINK_DELAY)
-        time.sleep(think_delay)
+            if MAX_ARTIFICIAL_THINK_DELAY:
+                think_delay = s["think_timer"].get_delay(
+                    board,
+                    engine.last_gap_cp,
+                    move,
+                    clock,
+                    from_book=engine.last_from_book,
+                )
+                think_delay = min(think_delay, MAX_ARTIFICIAL_THINK_DELAY)
+            else:
+                think_delay = 0.0
+        if think_delay:
+            time.sleep(think_delay)
     except Exception:
         logger.exception("Bot move calculation failed")
         with s["lock"]:

@@ -376,7 +376,10 @@ class WebAppTests(unittest.TestCase):
                 "/bot_move", json={"expected_version": 0}
             )
 
-        with mock.patch.object(web_app.time, "sleep", side_effect=delayed_sleep):
+        with (
+            mock.patch.object(web_app, "MAX_ARTIFICIAL_THINK_DELAY", 2.0),
+            mock.patch.object(web_app.time, "sleep", side_effect=delayed_sleep),
+        ):
             run_first()
             self.assertTrue(entered.wait(1))
             response = duplicate.post("/bot_move", json={"expected_version": 0})
@@ -405,13 +408,16 @@ class WebAppTests(unittest.TestCase):
             if delay == web_app.MAX_ARTIFICIAL_THINK_DELAY:
                 delay_observed.set()
 
-        with mock.patch.object(web_app.time, "sleep", side_effect=record_sleep):
+        with (
+            mock.patch.object(web_app, "MAX_ARTIFICIAL_THINK_DELAY", 2.0),
+            mock.patch.object(web_app.time, "sleep", side_effect=record_sleep),
+        ):
             response = client.post("/bot_move", json={"expected_version": 0})
             self.assertEqual(response.status_code, 202)
             self.assertTrue(delay_observed.wait(1))
             self.assertTrue(self._wait_for(lambda: not state["bot_busy"]))
 
-        self.assertIn(web_app.MAX_ARTIFICIAL_THINK_DELAY, observed)
+        self.assertIn(2.0, observed)
 
     def test_new_game_invalidates_pending_bot_move(self):
         first = web_app.app.test_client()
@@ -434,7 +440,10 @@ class WebAppTests(unittest.TestCase):
                 "/bot_move", json={"expected_version": 0}
             )
 
-        with mock.patch.object(web_app.time, "sleep", side_effect=delayed_sleep):
+        with (
+            mock.patch.object(web_app, "MAX_ARTIFICIAL_THINK_DELAY", 2.0),
+            mock.patch.object(web_app.time, "sleep", side_effect=delayed_sleep),
+        ):
             run_old_move()
             self.assertTrue(entered.wait(1))
             self._new_game(replacement, bot_color="black")

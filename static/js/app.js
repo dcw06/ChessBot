@@ -467,6 +467,10 @@ function initializeBoard(state) {
     orientation: humanColor,
     draggable: true,
     showNotation: prefs.coordinates,
+    appearSpeed: 0,
+    moveSpeed: 0,
+    snapSpeed: 0,
+    snapbackSpeed: 0,
     onDragStart,
     onDrop,
     onSnapEnd,
@@ -836,7 +840,7 @@ async function startGame({ rematch = false, switchColor = false } = {}) {
 function startPolling() {
   stopPolling();
   clockTimer = setInterval(renderClocks, 200);
-  schedulePoll(1000);
+  schedulePoll(100);
 }
 function stopPolling() {
   clearTimeout(pollTimer);
@@ -849,7 +853,7 @@ function schedulePoll(delay) {
 async function syncState() {
   if (gameOver || document.hidden) return;
   if (requestBusy) {
-    schedulePoll(250);
+    schedulePoll(100);
     return;
   }
   try {
@@ -871,7 +875,7 @@ async function syncState() {
     setConnected(true);
   } catch (error) {
     if (error instanceof CancelledRequest) {
-      schedulePoll(250);
+      schedulePoll(100);
       return;
     }
     pollFailures += 1;
@@ -881,7 +885,7 @@ async function syncState() {
     }
   }
   const normalDelay = Math.min(15000, 1000 * 2 ** pollFailures);
-  schedulePoll(lastState?.bot_busy && !pollFailures ? 250 : normalDelay);
+  schedulePoll(lastState?.bot_busy && !pollFailures ? 100 : normalDelay);
 }
 
 async function gameAction(path, confirmation) {

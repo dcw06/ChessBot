@@ -23,9 +23,9 @@ Open <http://localhost:5001>. Set `STOCKFISH_PATH` if Stockfish is not on
 `PATH`. `MODEL_PATH`, `MODEL_MANIFEST_PATH`, `MODEL_RELEASE_PATH`, `BOOK_PATH`,
 `CHESS_USERNAME`, `PORT`, `MAX_ACTIVE_GAMES`, `MAX_GAMES_PER_IP`,
 `GAME_IDLE_TTL`, `CAPACITY_EVICTION_IDLE`, and
-`MAX_ARTIFICIAL_THINK_DELAY` are also configurable. Bot replies include a
-human-like pause capped at two seconds by default; set the last value to `0`
-for immediate replies.
+`MAX_ARTIFICIAL_THINK_DELAY` are also configurable. Bot replies have no
+artificial pause by default; set the last value to a number of seconds to add
+a human-like delay.
 
 The server gives each browser an opaque HttpOnly game cookie. Games are
 isolated in memory, so use one Gunicorn worker unless the state store is moved
