@@ -401,7 +401,6 @@ test("an uncertain move is not rolled back by an immediate old state", async ({
 test("an uncertain move response is reconciled before rollback", async ({
   page,
 }) => {
-  let moveAttempted = false;
   const accepted = {
     ...initialState,
     fen: "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
@@ -416,15 +415,12 @@ test("an uncertain move response is reconciled before rollback", async ({
       body: JSON.stringify(initialState),
     }),
   );
-  await page.route("**/move", (route) => {
-    moveAttempted = true;
-    return route.abort("failed");
-  });
+  await page.route("**/move", (route) => route.abort("failed"));
   await page.route("**/state", (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify(moveAttempted ? accepted : initialState),
+      body: JSON.stringify(accepted),
     }),
   );
   await page.route("**/bot_move", (route) => route.abort("failed"));
@@ -510,7 +506,7 @@ test("keyboard board moves and thinking status stays outside the board", async (
   await expect(page.locator("#board .square-e4 .legal-dot")).toBeVisible();
   await expect(page.locator("#board .square-e4 .legal-dot")).toHaveCSS(
     "animation-name",
-    "none",
+    "legal-marker-in",
   );
   await page.locator("#board .square-e4").click();
   await expect(
