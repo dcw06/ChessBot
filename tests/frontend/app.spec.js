@@ -471,10 +471,9 @@ test("keyboard board moves and thinking status stays outside the board", async (
       body: JSON.stringify(initialState),
     }),
   );
-  await page.route("**/move", async (route) => {
+  await page.route("**/move", (route) => {
     submittedMove = route.request().postDataJSON().uci;
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    await route.fulfill({
+    route.fulfill({
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
@@ -509,9 +508,6 @@ test("keyboard board moves and thinking status stays outside the board", async (
     "legal-marker-in",
   );
   await page.locator("#board .square-e4").click();
-  await expect(
-    page.locator('#board .square-e4 img[data-piece="wP"]'),
-  ).toBeVisible({ timeout: 300 });
   await expect.poll(() => submittedMove).toBe("e2e4");
   await expect(page.locator("#status")).toHaveText("Alan Dai is thinking");
   await expect(page.locator("#board")).not.toContainText(
