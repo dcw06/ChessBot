@@ -173,7 +173,10 @@ class ChessBotEngine:
         resolved = stockfish_path or shutil.which("stockfish") or "/usr/games/stockfish"
         try:
             self.stockfish = StockfishFilter(resolved, threshold_cp=400)
-            print(f"[ChessBotEngine] Stockfish enabled (threshold=400cp, time=20ms)")
+            print(
+                "[ChessBotEngine] Stockfish enabled "
+                "(skill=18, threshold=400cp, time=20ms)"
+            )
         except FileNotFoundError as exc:
             self.stockfish = None
             logger.warning("Stockfish not found; safety filter disabled: %s", exc)

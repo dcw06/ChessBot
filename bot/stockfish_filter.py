@@ -6,6 +6,7 @@ from typing import Optional, List
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIME_LIMIT = 0.02  # 20ms — shallower search, misses subtle tactics like a human would
+DEFAULT_SKILL_LEVEL = 18  # Slightly below Stockfish's maximum of 20.
 
 # Moves within this many centipawns of best are considered "acceptable" choices.
 # The neural net then picks among them to preserve yuandan's style.
@@ -55,17 +56,23 @@ class StockfishFilter:
         stockfish_path: str,
         threshold_cp: int = 150,
         time_limit: float = DEFAULT_TIME_LIMIT,
+        skill_level: int = DEFAULT_SKILL_LEVEL,
     ):
         self.stockfish_path = stockfish_path
         self.threshold_cp = threshold_cp
         self.time_limit   = time_limit
+        self.skill_level = max(0, min(20, skill_level))
         self.last_error: Optional[str] = None
         self._engine = None
         self._start()
 
     def _start(self):
         self._engine = chess.engine.SimpleEngine.popen_uci(self.stockfish_path)
-        self._engine.configure({"Threads": 1, "Hash": 4})
+        self._engine.configure({
+            "Threads": 1,
+            "Hash": 4,
+            "Skill Level": self.skill_level,
+        })
         self.last_error = None
 
     def restart(self) -> bool:
