@@ -74,6 +74,50 @@ feature schema, action encoding, normalization, tensor names, and tensor
 shapes. The current model is self-contained; `*.onnx.data` files are neither
 required nor copied into the image.
 
+## Held-out model evaluation
+
+The behavioral-cloning model was trained on 10,297 personal bullet, blitz,
+and rapid games. It was evaluated on 69 newer blitz and rapid games that do
+not overlap the training PGN. One-minute bullet games were excluded. The test
+contains every position in which `yuandan` made a move, rather than a sampled
+subset.
+
+Top-1 exact-move agreement for the ONNX policy model:
+
+| Move range | Correct | Positions | Accuracy |
+| --- | ---: | ---: | ---: |
+| Move 1 | 67 | 69 | 97.10% |
+| Moves 2-5 | 245 | 276 | 88.77% |
+| Moves 6-15 | 398 | 688 | 57.85% |
+| Moves 16+ | 565 | 1,743 | 32.42% |
+| **Overall** | **1,275** | **2,776** | **45.93%** |
+
+Additional breakdowns:
+
+| Segment | Correct | Positions | Accuracy |
+| --- | ---: | ---: | ---: |
+| 3-minute games | 284 | 582 | 48.80% |
+| 10-minute games | 991 | 2,194 | 45.17% |
+| Playing White | 730 | 1,594 | 45.80% |
+| Playing Black | 545 | 1,182 | 46.11% |
+
+This measures whether the model's highest-scoring legal move exactly matches
+the historical move. It is not a chess-strength or win-rate measurement, and
+it evaluates the ONNX policy alone, without the opening book, tactical rules,
+time-management behavior, or Stockfish safety filter used during gameplay.
+
+The evaluation is reproducible with:
+
+```sh
+python -m scripts.evaluate_model_accuracy \
+  --pgn yuandan_nonoverlapping_nonbullet_games_2026-08-11.pgn \
+  --username yuandan \
+  --sample-size 1000000 \
+  --after-move 0 \
+  --seed 20260811 \
+  --output model_accuracy_yuandan_nonoverlapping_nonbullet_all_positions_2026-08-11
+```
+
 ## Train
 
 Training requires the larger exact dependency lock:
