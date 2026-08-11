@@ -84,10 +84,10 @@ def accuracy_summary(rows: list[dict]) -> dict:
         "timeControl": lambda row: row["timeControl"],
         "userColor": lambda row: row["userColor"],
         "movePhase": lambda row: (
-            "1-5" if row["fullmove"] <= 5
+            "1" if row["fullmove"] == 1
+            else "2-5" if row["fullmove"] <= 5
             else "6-15" if row["fullmove"] <= 15
-            else "16-30" if row["fullmove"] <= 30
-            else "31+"
+            else "16+"
         ),
     }
     for name, key_function in dimensions.items():
