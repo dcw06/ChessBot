@@ -9,6 +9,8 @@ local_games.json
 *.pgn
 model_review/
 model_review_artifact.zip
+model_accuracy_*.json
+model_accuracy_*.csv
 *.onnx.data
 checkpoint.pt
 analyze_style*.py
