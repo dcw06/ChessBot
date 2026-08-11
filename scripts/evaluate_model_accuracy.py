@@ -15,7 +15,6 @@ import chess.pgn
 from bot.model_contract import resolve_release_paths
 from scripts.build_model_review import predict_positions, sha256_file
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -85,7 +84,8 @@ def accuracy_summary(rows: list[dict]) -> dict:
         "timeControl": lambda row: row["timeControl"],
         "userColor": lambda row: row["userColor"],
         "movePhase": lambda row: (
-            "6-15" if row["fullmove"] <= 15
+            "1-5" if row["fullmove"] <= 5
+            else "6-15" if row["fullmove"] <= 15
             else "16-30" if row["fullmove"] <= 30
             else "31+"
         ),
@@ -176,4 +176,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

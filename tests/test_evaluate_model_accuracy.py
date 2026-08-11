@@ -10,6 +10,7 @@ def test_one_minute_filter_uses_base_seconds():
 
 def test_accuracy_summary_counts_exact_matches():
     rows = [
+        {"matchesActual": True, "timeControl": "180", "userColor": "white", "fullmove": 2},
         {"matchesActual": True, "timeControl": "180", "userColor": "white", "fullmove": 6},
         {"matchesActual": False, "timeControl": "180", "userColor": "black", "fullmove": 16},
         {"matchesActual": True, "timeControl": "600", "userColor": "white", "fullmove": 31},
@@ -17,7 +18,8 @@ def test_accuracy_summary_counts_exact_matches():
 
     summary = accuracy_summary(rows)
 
-    assert summary["positions"] == 3
-    assert summary["correct"] == 2
-    assert summary["accuracy"] == 0.666667
+    assert summary["positions"] == 4
+    assert summary["correct"] == 3
+    assert summary["accuracy"] == 0.75
+    assert summary["breakdowns"]["movePhase"]["1-5"]["accuracy"] == 1.0
     assert summary["breakdowns"]["movePhase"]["6-15"]["accuracy"] == 1.0
