@@ -7,6 +7,8 @@ __pycache__/
 .env
 local_games.json
 *.pgn
+model_review/
+model_review_artifact.zip
 *.onnx.data
 checkpoint.pt
 analyze_style*.py

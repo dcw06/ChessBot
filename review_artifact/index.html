@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ChessBot Model Review</title>
+  <link rel="stylesheet" href="review.css">
+  <link rel="stylesheet" href="mobile.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">CHESSBOT EVALUATION</p>
+      <h1>Policy move review</h1>
+    </div>
+    <div class="header-actions">
+      <button id="export" class="icon-command" type="button" title="Export review results">Export JSON</button>
+      <button id="reset" class="icon-command quiet" type="button">Reset</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="progress-band" aria-label="Review progress">
+      <div class="progress-copy"><strong id="progress-label">0 / 300 reviewed</strong><span id="remaining-label">300 remaining</span></div>
+      <div class="progress-track"><div id="progress-fill"></div></div>
+      <div class="summary">
+        <span><b id="agree-count">0</b> Agree</span>
+        <span><b id="disagree-count">0</b> Disagree</span>
+        <span><b id="skip-count">0</b> Skipped</span>
+      </div>
+    </section>
+
+    <section class="workspace">
+      <div class="board-column">
+        <div id="board" class="board" aria-label="Chess position"></div>
+        <div class="board-footer"><span id="orientation"></span><span id="position-id"></span></div>
+      </div>
+
+      <aside class="review-panel">
+        <div class="game-meta">
+          <span id="game-date"></span>
+          <span id="game-result"></span>
+        </div>
+        <h2 id="players"></h2>
+        <p id="move-context" class="muted"></p>
+
+        <div class="move-callout">
+          <span>Model move</span>
+          <strong id="model-move"></strong>
+          <small id="model-detail"></small>
+        </div>
+
+        <div class="decision-group">
+          <button id="agree" class="decision agree" type="button">Agree</button>
+          <button id="disagree" class="decision disagree" type="button">Disagree</button>
+          <button id="skip" class="decision skip" type="button">Skip</button>
+        </div>
+
+        <label for="note">Review note</label>
+        <textarea id="note" rows="3" placeholder="Optional rationale"></textarea>
+
+        <div class="navigation">
+          <button id="previous" type="button">Previous</button>
+          <button id="next" type="button">Next</button>
+        </div>
+      </aside>
+    </section>
+  </main>
+  <script src="review-data.js"></script>
+  <script src="review.js"></script>
+</body>
+</html>

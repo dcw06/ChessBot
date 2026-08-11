@@ -122,6 +122,20 @@ environment:
 Review and commit both lock-file changes. Do not edit generated hash sections
 by hand.
 
+## Build a model-review artifact
+
+Place `all_games.pgn` in the repository root, then generate a deterministic
+300-position review set from distinct standard-chess games:
+
+```powershell
+python -m scripts.build_model_review --count 300 --output model_review
+python -m http.server 8765 --bind 127.0.0.1 --directory model_review
+```
+
+Open <http://127.0.0.1:8765>. Decisions are stored locally in the browser and
+can be exported as JSON. The PGN and generated artifact are intentionally not
+tracked by Git.
+
 ## Deploy
 
 Build and smoke-test the image:

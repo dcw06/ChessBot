@@ -1,0 +1,44 @@
+@media (max-width: 760px) {
+  html,
+  body {
+    max-width: 100%;
+    overflow-x: hidden;
+  }
+
+  .topbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .header-actions {
+    flex-direction: row;
+  }
+
+  .header-actions button {
+    flex: 1;
+  }
+
+  .workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .board-column {
+    min-width: 0;
+  }
+
+  .board {
+    grid-template-columns: repeat(8, minmax(0, 1fr));
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  .square {
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .summary {
+    gap: 8px;
+    font-size: 12px;
+  }
+}
