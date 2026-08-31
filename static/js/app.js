@@ -1,6 +1,10 @@
 import { ApiError, api, CancelledRequest, cancelRequest, post } from "./api.js";
 import { playSound, setSoundEnabled, soundEnabled } from "./sounds.js";
-import { classifyResult, formatClock } from "./chess-utils.js";
+import {
+  classifyResult,
+  evaluationPercent,
+  formatClock,
+} from "./chess-utils.js";
 import { createManagedBoard } from "./managed-board.js";
 
 const $ = (id) => document.getElementById(id);
@@ -582,11 +586,7 @@ async function updateLiveEvaluation(fen) {
       { fen },
       { key: "live-evaluation", timeout: 10000 },
     );
-    const percent = data.is_mate
-      ? data.cp > 0
-        ? 100
-        : 0
-      : Math.max(3, Math.min(97, 50 + 50 * Math.tanh(data.cp / 300)));
+    const percent = evaluationPercent(data.cp, data.is_mate, humanColor);
     $("live-eval-fill").style.height = `${percent}%`;
     $("live-eval-label").textContent = data.is_mate
       ? `M${Math.abs(data.mate)}`

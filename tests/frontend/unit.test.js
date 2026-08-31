@@ -35,6 +35,12 @@ test("evaluation percentage remains bounded", () => {
   assert.equal(evaluationPercent(1, true), 100);
 });
 
+test("evaluation percentage follows the board orientation", () => {
+  assert.equal(evaluationPercent(300, false, "black"), 100 - evaluationPercent(300));
+  assert.equal(evaluationPercent(-1, true, "black"), 100);
+  assert.equal(evaluationPercent(1, true, "black"), 0);
+});
+
 test("superseded requests are classified as cancellations", async () => {
   const originalFetch = globalThis.fetch;
   let requestCount = 0;

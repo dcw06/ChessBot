@@ -19,9 +19,13 @@ export function formatClock(seconds) {
     .padStart(2, "0")}`;
 }
 
-export function evaluationPercent(cp, isMate = false) {
-  if (isMate) return cp > 0 ? 100 : 0;
-  return Math.max(3, Math.min(97, 50 + 50 * Math.tanh(cp / 300)));
+export function evaluationPercent(cp, isMate = false, orientation = "white") {
+  const whitePercent = isMate
+    ? cp > 0
+      ? 100
+      : 0
+    : Math.max(3, Math.min(97, 50 + 50 * Math.tanh(cp / 300)));
+  return orientation === "black" ? 100 - whitePercent : whitePercent;
 }
 
 export function classifyMoveQuality(previousCp, currentCp, moverWasWhite) {
