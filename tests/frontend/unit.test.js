@@ -36,7 +36,10 @@ test("evaluation percentage remains bounded", () => {
 });
 
 test("evaluation percentage follows the board orientation", () => {
-  assert.equal(evaluationPercent(300, false, "black"), 100 - evaluationPercent(300));
+  assert.equal(
+    evaluationPercent(300, false, "black"),
+    100 - evaluationPercent(300),
+  );
   assert.equal(evaluationPercent(-1, true, "black"), 100);
   assert.equal(evaluationPercent(1, true, "black"), 0);
 });
