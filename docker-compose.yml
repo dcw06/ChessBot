@@ -1,0 +1,28 @@
+services:
+  chessbot:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:10000:10000"
+    environment:
+      PORT: "10000"
+      CHESS_USERNAME: ${CHESS_USERNAME:-yuandan}
+      MAX_ACTIVE_GAMES: "8"
+      LOCAL_GAMES_PATH: /data/local_games.json
+      TRUST_PROXY_HEADERS: "1"
+      # Enable only when the proxy strips this header from non-Cloudflare clients.
+      TRUST_CLOUDFLARE_HEADERS: ${TRUST_CLOUDFLARE_HEADERS:-0}
+      COOKIE_SECURE: "1"
+    volumes:
+      - chessbot_data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  chessbot_data:

@@ -50,6 +50,7 @@ let gameSyncFailed = false;
 let lastState = null;
 let lastMoveCount = 0;
 let lastEvaluatedVersion = -1;
+let liveEvaluationRetry;
 let liveEvaluationUnavailableNotified = false;
 let clocks = { bot: 180, human: 180, at: performance.now(), turn: "white" };
 const clockAnnouncements = { top: new Set(), bottom: new Set() };
@@ -460,6 +461,10 @@ function applyHighlights() {
 
 function initializeBoard(state) {
   game = new Chess(state.fen);
+  $("live-eval-wrap").classList.toggle(
+    "black-orientation",
+    humanColor === "black",
+  );
   board?.destroy();
   board = createManagedBoard("board", {
     position: state.fen,
@@ -580,12 +585,14 @@ function handleState(state, localMove = null) {
 }
 
 async function updateLiveEvaluation(fen) {
+  clearTimeout(liveEvaluationRetry);
   try {
     const data = await post(
       "/api/eval",
       { fen },
       { key: "live-evaluation", timeout: 10000 },
     );
+    if (!$("live-eval-toggle").checked || lastState?.fen !== fen) return;
     const percent = evaluationPercent(data.cp, data.is_mate, humanColor);
     $("live-eval-fill").style.height = `${percent}%`;
     $("live-eval-label").textContent = data.is_mate
@@ -593,6 +600,14 @@ async function updateLiveEvaluation(fen) {
       : `${data.cp >= 0 ? "+" : ""}${(data.cp / 100).toFixed(1)}`;
   } catch (error) {
     if (error instanceof CancelledRequest) return;
+    if (!$("live-eval-toggle").checked || lastState?.fen !== fen) return;
+    if (error instanceof ApiError && error.status === 429) {
+      liveEvaluationRetry = setTimeout(() => {
+        if ($("live-eval-toggle").checked && lastState?.fen === fen)
+          updateLiveEvaluation(fen);
+      }, 2200);
+      return;
+    }
     if (error instanceof ApiError && error.status === 503) {
       $("live-eval-toggle").checked = false;
       $("live-eval-wrap").hidden = true;
@@ -712,10 +727,8 @@ function renderClocks() {
   const elapsed = (performance.now() - clocks.at) / 1000;
   if (!gameOver)
     clocks.turn === botColor ? (bot -= elapsed) : (human -= elapsed);
-  const top = botColor === "black" ? bot : human;
-  const bottom = botColor === "black" ? human : bot;
-  setClock($("top-time"), top);
-  setClock($("bottom-time"), bottom);
+  setClock($("top-time"), bot);
+  setClock($("bottom-time"), human);
 }
 function setClock(element, seconds) {
   seconds = Math.max(0, seconds);
@@ -812,6 +825,11 @@ async function startGame({ rematch = false, switchColor = false } = {}) {
     gameSyncFailed = false;
     pendingMove = null;
     lastMoveCount = 0;
+    cancelRequest("live-evaluation");
+    clearTimeout(liveEvaluationRetry);
+    lastEvaluatedVersion = -1;
+    $("live-eval-fill").style.height = "50%";
+    $("live-eval-label").textContent = "0.0";
     clockAnnouncements.top.clear();
     clockAnnouncements.bottom.clear();
     initializeBoard(state);
@@ -922,6 +940,7 @@ async function endGameAndHome() {
     stopPolling();
     cancelRequest("game-state");
     cancelRequest("live-evaluation");
+    clearTimeout(liveEvaluationRetry);
     if ($("result-dialog").open) $("result-dialog").close();
     $("game-panel").hidden = true;
     $("setup-panel").hidden = false;
@@ -1089,6 +1108,8 @@ function bindEvents() {
     applyPreferences();
   });
   $("live-eval-toggle").addEventListener("change", (event) => {
+    clearTimeout(liveEvaluationRetry);
+    cancelRequest("live-evaluation");
     $("live-eval-wrap").hidden = !event.target.checked;
     if (event.target.checked && lastState) {
       liveEvaluationUnavailableNotified = false;

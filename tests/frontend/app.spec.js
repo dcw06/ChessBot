@@ -555,6 +555,75 @@ test("underpromotion choice is sent to the server", async ({ page }) => {
   await expect.poll(() => submittedMove).toBe("a7a8n");
 });
 
+test("Black-side evaluation colors, score, and clocks follow the board", async ({
+  page,
+}) => {
+  const state = {
+    ...initialState,
+    fen: "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+    bot_color: "white",
+    turn: "black",
+    moves: ["e4"],
+    version: 1,
+    bot_clock: 120,
+    human_clock: 240,
+  };
+  for (const routePath of ["**/new_game", "**/state"])
+    await page.route(routePath, (route) => route.fulfill({ json: state }));
+  await page.route("**/api/eval", (route) =>
+    route.fulfill({
+      json: { cp: 300, is_mate: false, mate: null },
+    }),
+  );
+  await page.goto("/");
+  await page.locator('.color-btn[data-color="black"]').click();
+  await page.getByRole("button", { name: "Start game" }).click();
+  await page.locator("#live-eval-toggle").check();
+  await expect(page.locator("#live-eval-label")).toHaveText("+3.0");
+  await expect(page.locator("#live-eval-wrap")).toHaveClass(
+    /black-orientation/,
+  );
+  await expect(page.locator("#live-eval-fill")).toHaveCSS(
+    "background-color",
+    "rgb(17, 17, 17)",
+  );
+  await expect
+    .poll(() =>
+      page
+        .locator("#live-eval-fill")
+        .evaluate((el) => parseFloat(el.style.height)),
+    )
+    .toBeLessThan(15);
+  await expect(page.locator("#top-time")).toHaveText("2:00");
+  await expect(page.locator("#bottom-time")).toHaveText(/^(4:00|3:5\d)$/);
+});
+
+test("live evaluation retries engine contention without reporting a disconnect", async ({
+  page,
+}) => {
+  for (const routePath of ["**/new_game", "**/state"])
+    await page.route(routePath, (route) =>
+      route.fulfill({ json: initialState }),
+    );
+  let calls = 0;
+  await page.route("**/api/eval", (route) => {
+    calls += 1;
+    return route.fulfill(
+      calls === 1
+        ? { status: 429, json: { error: "Analysis is busy." } }
+        : { json: { cp: 100, is_mate: false, mate: null } },
+    );
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Start game" }).click();
+  await page.locator("#live-eval-toggle").check();
+  await expect(page.locator("#live-eval-label")).toHaveText("+1.0", {
+    timeout: 8000,
+  });
+  expect(calls).toBeGreaterThanOrEqual(2);
+  await expect(page.locator("#toast-region")).not.toContainText("unavailable");
+});
+
 test("mobile layout has no horizontal overflow", async ({ page, isMobile }) => {
   test.skip(!isMobile, "Mobile visual baseline only");
   await page.route("**/health/ready", (route) =>

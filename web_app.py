@@ -6,6 +6,7 @@ import threading
 import atexit
 import logging
 import secrets
+import hashlib
 from pathlib import Path
 from collections import defaultdict, deque
 from urllib.parse import urlsplit
@@ -25,11 +26,16 @@ from bot.model_contract import resolve_release_paths
 
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
+ASSET_VERSION = hashlib.sha256(b"".join(
+    path.read_bytes()
+    for path in sorted((Path(app.root_path) / "static" / "dist").rglob("*"))
+    if path.is_file()
+)).hexdigest()[:16]
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 if os.environ.get("TRUST_PROXY_HEADERS", "0") == "1":
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-USERNAME         = os.environ.get("CHESS_USERNAME", os.environ.get("USERNAME", "yuandan"))
+USERNAME         = os.environ.get("CHESS_USERNAME", "yuandan")
 MODEL_PATH       = os.environ.get("MODEL_PATH",       "best_model.onnx")
 # Older local .env files pointed serving at the PyTorch checkpoint. Serving only
 # accepts ONNX, so recover to the documented deployment artifact automatically.
@@ -158,7 +164,7 @@ def _request_data() -> dict:
 
 def _client_owner() -> str:
     forwarded = request.headers.get("CF-Connecting-IP", "").strip()
-    if forwarded:
+    if os.environ.get("TRUST_CLOUDFLARE_HEADERS", "0") == "1" and forwarded:
         try:
             return str(ipaddress.ip_address(forwarded))
         except ValueError:
@@ -180,7 +186,7 @@ def _same_origin() -> bool:
 
 def _rate_allowed(bucket: str, limit: int, window_seconds: float) -> bool:
     now = time.monotonic()
-    key = (bucket, request.remote_addr or "unknown")
+    key = (bucket, _client_owner())
     with _rate_lock:
         if len(_rate_events) > 4096:
             oldest = sorted(
@@ -242,7 +248,7 @@ def _security_headers(response):
         )
         response.headers["Cache-Control"] = (
             "public, max-age=604800, immutable"
-            if fingerprinted else "public, max-age=3600, must-revalidate"
+            if fingerprinted else "public, max-age=0, must-revalidate"
         )
     else:
         response.headers.setdefault("Cache-Control", "no-store")
@@ -555,20 +561,45 @@ def api_local_games():
     return jsonify({"games": games})
 
 
+def _analysis_board(data):
+    fen = data.get("fen")
+    if not isinstance(fen, str) or not fen.strip():
+        raise ValueError("A valid FEN position is required.")
+    try:
+        board = chess.Board(fen)
+    except ValueError:
+        raise ValueError("Invalid FEN position.") from None
+    if not board.is_valid():
+        raise ValueError("Invalid chess position.")
+    return board
+
+
+def _terminal_score(board):
+    if board.is_checkmate():
+        return {"cp": -10000 if board.turn == chess.WHITE else 10000,
+                "is_mate": True, "mate": 0}
+    if board.is_game_over():
+        return {"cp": 0, "is_mate": False, "mate": None}
+    return None
+
+
 @app.route("/api/eval", methods=["POST"])
 def api_eval():
-    """Run Stockfish depth-15 on a FEN, return centipawn score from White's POV."""
-    fen = _request_data().get("fen", "")
+    """Evaluate a valid position with bounded search time, from White's POV."""
+    try:
+        board = _analysis_board(_request_data())
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    terminal = _terminal_score(board)
+    if terminal is not None:
+        return jsonify(terminal)
     if not _analysis_lock.acquire(blocking=False):
         return jsonify({"error": "Analysis is busy. Try again shortly."}), 429
     try:
         sf = _get_analysis_sf()
         if sf is None:
             return jsonify({"error": "Stockfish unavailable"}), 503
-        board = chess.Board(fen)
-        if board.is_game_over():
-            return jsonify({"cp": 0, "is_mate": False, "mate": None})
-        info = sf.analyse(board, chess.engine.Limit(depth=15))
+        info = sf.analyse(board, chess.engine.Limit(depth=15, time=0.3))
         score = info["score"].white()
         if score.is_mate():
             m = score.mate()
@@ -587,7 +618,18 @@ def api_eval():
 def api_lines():
     """Run Stockfish multipv=3 depth-15 on a FEN; return top-3 lines with SAN continuations."""
     data = _request_data()
-    fen = data.get("fen", "")
+    try:
+        board = _analysis_board(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    terminal = _terminal_score(board)
+    if terminal is not None:
+        return jsonify({
+            "lines": [], "depth": 0,
+            "eval_cp": terminal["cp"],
+            "eval_is_mate": terminal["is_mate"],
+            "eval_mate": terminal["mate"],
+        })
     multipv = min(5, max(1, data.get("lines", 3))) if isinstance(data.get("lines", 3), int) else 3
     think_time = data.get("time", 0.3)
     think_time = min(2.0, max(0.05, float(think_time))) if isinstance(think_time, (int, float)) else 0.3
@@ -597,9 +639,6 @@ def api_lines():
         sf = _get_analysis_sf()
         if sf is None:
             return jsonify({"error": "Stockfish unavailable"}), 503
-        board = chess.Board(fen)
-        if board.is_game_over():
-            return jsonify({"lines": []})
         infos = sf.analyse(board, chess.engine.Limit(time=think_time), multipv=multipv)
         if not isinstance(infos, list):
             infos = [infos]
@@ -639,7 +678,7 @@ def api_lines():
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", asset_version=ASSET_VERSION)
 
 
 @app.route("/new_game", methods=["POST"])
@@ -658,7 +697,7 @@ def new_game():
             return jsonify({"error": "Custom clock must be between 1 and 180 minutes."}), 400
         if not isinstance(increment_seconds, (int, float)) or not 0 <= increment_seconds <= 60:
             return jsonify({"error": "Increment must be between 0 and 60 seconds."}), 400
-    if tc not in TIME_CONTROLS:
+    if not isinstance(tc, str) or tc not in TIME_CONTROLS:
         return jsonify({"error": "Unsupported time control."}), 400
     if bot_color not in ("white", "black"):
         return jsonify({"error": "bot_color must be 'white' or 'black'."}), 400

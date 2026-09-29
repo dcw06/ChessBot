@@ -475,6 +475,8 @@ export function openGame(game) {
 }
 
 function scheduleAnalysis() {
+  analysisGeneration += 1;
+  cancelRequest("analysis-lines");
   clearTimeout(debounce);
   if (engineUnavailable) {
     renderEngineUnavailable();
@@ -527,6 +529,12 @@ async function analyzePosition() {
     });
     renderMoveTree();
   } catch (error) {
+    if (generation !== analysisGeneration) return;
+    if (error instanceof ApiError && error.status === 429) {
+      clearTimeout(debounce);
+      debounce = setTimeout(analyzePosition, 2200);
+      return;
+    }
     if (error instanceof ApiError && error.status === 503) {
       engineUnavailable = true;
       renderEngineUnavailable();
@@ -787,6 +795,7 @@ export function initAnalysis() {
 }
 
 export function deactivateAnalysis() {
+  analysisGeneration += 1;
   clearTimeout(debounce);
   cancelRequest("analysis-lines");
   $("analysis-progress").hidden = true;

@@ -619,6 +619,12 @@ kbd {
   background: #eee;
   transition: height 0.3s;
 }
+.vertical-eval.black-orientation {
+  background: #eee;
+}
+.vertical-eval.black-orientation div {
+  background: #111;
+}
 .vertical-eval span {
   position: absolute;
   z-index: 2;
@@ -626,6 +632,7 @@ kbd {
   left: 50%;
   transform: translateX(-50%) rotate(-90deg);
   color: #fff;
+  mix-blend-mode: difference;
   font-size: 0.65rem;
 }
 .analysis-toolbar {

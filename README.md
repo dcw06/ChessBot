@@ -38,7 +38,8 @@ is full, a game inactive for at least five minutes may be reclaimed.
 Run the complete test suite and production smoke test:
 
 ```sh
-.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m pip install pytest==9.1.1
+.venv/bin/python -m pytest -q
 .venv/bin/python -m scripts.smoke_test
 ```
 
@@ -181,6 +182,24 @@ can be exported as JSON. The PGN and generated artifact are intentionally not
 tracked by Git.
 
 ## Deploy
+
+The tracked `docker-compose.yml` persists saved games in `chessbot_data`, binds
+only to localhost, and explicitly passes `CHESS_USERNAME` from `.env` (default:
+`yuandan`). After pulling a release, run `docker compose up -d --build --wait`.
+The default Compose limits are 768 MB RAM, one CPU, and eight active games;
+additional concurrent demand receives a retryable capacity response.
+
+For the Cloudflare deployment, `deploy/chessbot.caddy` routes to port 10000 and
+strips client-IP headers on direct, non-Cloudflare requests. Once that proxy
+configuration is active, set `TRUST_CLOUDFLARE_HEADERS=1` in `.env` and recreate
+the container. Leave it disabled with proxies that do not sanitize this header.
+Keep the published Cloudflare IP ranges in the Caddy configuration up to date.
+
+The page versions bundled assets by their content hash. Unhashed assets must
+revalidate; hashed chunks can be cached. Live evaluation has a 300 ms search
+budget, and invalid analysis positions return HTTP 400 without restarting the
+engine. Games remain in memory: a deployment interrupts active games, while
+completed games in the named volume are preserved.
 
 Build and smoke-test the image:
 

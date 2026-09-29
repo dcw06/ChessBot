@@ -318,6 +318,7 @@ class WebAppTests(unittest.TestCase):
         )
         self.assertEqual(limited.status_code, 429)
 
+    @mock.patch.dict(web_app.os.environ, {"TRUST_CLOUDFLARE_HEADERS": "1"})
     def test_cloudflare_client_ip_separates_visitors(self):
         clients = [web_app.app.test_client() for _ in range(2)]
         for index, client in enumerate(clients, start=10):
@@ -357,6 +358,55 @@ class WebAppTests(unittest.TestCase):
         finally:
             web_app._analysis_lock.release()
         self.assertEqual(response.status_code, 429)
+
+    def test_invalid_analysis_positions_do_not_restart_engine(self):
+        client = web_app.app.test_client()
+        with mock.patch.object(web_app, "_get_analysis_sf") as engine:
+            for endpoint in ("/api/eval", "/api/lines"):
+                for fen in (None, [], "invalid", "8/8/8/8/8/8/8/8 w - - 0 1"):
+                    with self.subTest(endpoint=endpoint, fen=fen):
+                        self.assertEqual(client.post(endpoint, json={"fen": fen}).status_code, 400)
+            engine.assert_not_called()
+
+    def test_analysis_reports_checkmate_and_draw_without_engine(self):
+        client = web_app.app.test_client()
+        mate = "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3"
+        draw = "8/8/8/8/8/8/7k/K7 w - - 0 1"
+        with mock.patch.object(web_app, "_get_analysis_sf") as engine:
+            for endpoint, prefix in (("/api/eval", ""), ("/api/lines", "eval_")):
+                score = client.post(endpoint, json={"fen": mate}).get_json()
+                self.assertEqual(score[prefix + "cp"], -10000)
+                self.assertTrue(score[prefix + "is_mate"])
+                score = client.post(endpoint, json={"fen": draw}).get_json()
+                self.assertEqual(score[prefix + "cp"], 0)
+                self.assertFalse(score[prefix + "is_mate"])
+            engine.assert_not_called()
+
+    def test_live_analysis_has_a_time_budget(self):
+        engine = mock.Mock()
+        engine.analyse.return_value = {"score": chess.engine.PovScore(chess.engine.Cp(50), chess.WHITE)}
+        with mock.patch.object(web_app, "_get_analysis_sf", return_value=engine):
+            response = web_app.app.test_client().post("/api/eval", json={"fen": chess.STARTING_FEN})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(engine.analyse.call_args.args[1].time, 0.3)
+
+    @mock.patch.dict(web_app.os.environ, {"TRUST_CLOUDFLARE_HEADERS": "0"})
+    def test_untrusted_cloudflare_header_cannot_bypass_limit(self):
+        with web_app.app.test_request_context(headers={"CF-Connecting-IP": "203.0.113.1"},
+                                              environ_base={"REMOTE_ADDR": "198.51.100.1"}):
+            self.assertEqual(web_app._client_owner(), "198.51.100.1")
+
+    @mock.patch.dict(web_app.os.environ, {"TRUST_CLOUDFLARE_HEADERS": "1"})
+    def test_analysis_rate_limits_are_per_visitor(self):
+        client = web_app.app.test_client()
+        for _ in range(web_app.ANALYSIS_RATE_LIMIT):
+            client.post("/api/eval", json={"fen": "bad"}, headers={"CF-Connecting-IP": "203.0.113.1"})
+        self.assertEqual(client.post("/api/eval", json={"fen": "bad"},
+                                    headers={"CF-Connecting-IP": "203.0.113.2"}).status_code, 400)
+
+    def test_new_game_rejects_unhashable_time_control(self):
+        response = web_app.app.test_client().post("/new_game", json={"tc": []})
+        self.assertEqual(response.status_code, 400)
 
     def test_duplicate_bot_move_is_rejected(self):
         first = web_app.app.test_client()
