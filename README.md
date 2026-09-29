@@ -195,8 +195,8 @@ configuration is active, set `TRUST_CLOUDFLARE_HEADERS=1` in `.env` and recreate
 the container. Leave it disabled with proxies that do not sanitize this header.
 Keep the published Cloudflare IP ranges in the Caddy configuration up to date.
 
-The page versions bundled assets by their content hash. Unhashed assets must
-revalidate; hashed chunks can be cached. Live evaluation has a 300 ms search
+The page versions bundled assets by their content hash. Unhashed entry files
+use `no-store`; hashed chunks can be cached. Live evaluation has a 300 ms search
 budget, and invalid analysis positions return HTTP 400 without restarting the
 engine. Games remain in memory: a deployment interrupts active games, while
 completed games in the named volume are preserved.

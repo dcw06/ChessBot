@@ -29,5 +29,5 @@ RUN REQUIRE_STOCKFISH=1 python -m scripts.smoke_test
 EXPOSE 10000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:10000/health/ready', timeout=3)" || exit 1
-CMD gunicorn -w 1 --worker-class gthread --threads 4 --timeout 120 \
+CMD gunicorn -w 1 --worker-class gthread --threads 4 --timeout 120 --no-control-socket \
     -b 0.0.0.0:${PORT:-10000} web_app:app

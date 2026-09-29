@@ -248,7 +248,7 @@ def _security_headers(response):
         )
         response.headers["Cache-Control"] = (
             "public, max-age=604800, immutable"
-            if fingerprinted else "public, max-age=0, must-revalidate"
+            if fingerprinted and response.status_code < 400 else "no-store"
         )
     else:
         response.headers.setdefault("Cache-Control", "no-store")

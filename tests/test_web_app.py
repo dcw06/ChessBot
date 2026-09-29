@@ -252,9 +252,12 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("script-src 'self'", page.headers["Content-Security-Policy"])
         self.assertNotIn("script-src 'self' 'unsafe-inline'", page.headers["Content-Security-Policy"])
         asset = client.get("/static/dist/app.min.js")
-        self.assertIn("public", asset.headers["Cache-Control"])
-        self.assertNotIn("no-cache", asset.headers["Cache-Control"])
+        self.assertEqual(asset.headers["Cache-Control"], "no-store")
         asset.close()
+        missing = client.get("/static/dist/chunks/missing.js")
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.headers["Cache-Control"], "no-store")
+        missing.close()
 
     def test_undo_restores_position_before_complete_turn(self):
         client = web_app.app.test_client()
