@@ -113,6 +113,21 @@ def accuracy_summary(rows: list[dict]) -> dict:
     }
 
 
+
+def uniform_legal_expected_agreement(positions: list[dict]) -> float:
+    """Expected exact-move agreement under a uniform policy on the same positions."""
+    if not positions:
+        raise ValueError("No eligible positions to evaluate")
+    probabilities = []
+    for position in positions:
+        board = chess.Board(position["fen"])
+        played = chess.Move.from_uci(position["playedMoveUci"])
+        if played not in board.legal_moves:
+            raise ValueError("Historical move is not legal in its evaluation position")
+        probabilities.append(1.0 / board.legal_moves.count())
+    return sum(probabilities) / len(probabilities)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pgn", type=Path, required=True)
@@ -130,6 +145,7 @@ def main() -> None:
         if len(eligible) >= args.sample_size
         else eligible
     )
+    baseline = uniform_legal_expected_agreement(sample)
     model_path, manifest_path = resolve_release_paths(
         ROOT / "best_model.onnx", ROOT / "best_model.manifest.json",
         ROOT / "best_model.release.json",
@@ -157,6 +173,7 @@ def main() -> None:
             **game_counts,
         },
         "summary": summary,
+        "baseline": {"policy": "uniform over legal moves", "expectedExactMoveAgreement": baseline, "scope": "same sampled positions; theoretical expectation, not a sampled run"},
         "positions": rows,
     }
     json_path = args.output.with_suffix(".json")

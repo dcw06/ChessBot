@@ -25,3 +25,16 @@ def test_accuracy_summary_counts_exact_matches():
     assert summary["breakdowns"]["movePhase"]["1"]["accuracy"] == 0.0
     assert summary["breakdowns"]["movePhase"]["2-5"]["accuracy"] == 1.0
     assert summary["breakdowns"]["movePhase"]["6-15"]["accuracy"] == 1.0
+
+
+def test_uniform_legal_baseline_uses_same_legal_positions():
+    import chess
+    import pytest
+    from scripts.evaluate_model_accuracy import uniform_legal_expected_agreement
+
+    position = {"fen": chess.STARTING_FEN, "playedMoveUci": "e2e4"}
+    assert uniform_legal_expected_agreement([position]) == pytest.approx(1 / 20)
+    with pytest.raises(ValueError, match="not legal"):
+        uniform_legal_expected_agreement([{**position, "playedMoveUci": "e2e5"}])
+    with pytest.raises(ValueError, match="No eligible"):
+        uniform_legal_expected_agreement([])

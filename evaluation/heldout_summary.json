@@ -1,0 +1,32 @@
+{
+  "provenance": "Aggregate counts transcribed from README at a9bc36addf54056705fa898218dc07d0f1faedf1; historical evaluation, not rerun by this change",
+  "training_games": 10297,
+  "heldout_games": 69,
+  "positions": 2776,
+  "correct": 1275,
+  "metric": "top-1 exact legal move agreement, ONNX policy only",
+  "segments": [
+    {
+      "moves": "1",
+      "correct": 67,
+      "positions": 69
+    },
+    {
+      "moves": "2-5",
+      "correct": 245,
+      "positions": 276
+    },
+    {
+      "moves": "6-15",
+      "correct": 398,
+      "positions": 688
+    },
+    {
+      "moves": "16+",
+      "correct": 565,
+      "positions": 1743
+    }
+  ],
+  "raw_pgn_distributed": false,
+  "historical_baseline": null
+}
